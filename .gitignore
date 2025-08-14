@@ -1,0 +1,7 @@
+models/
+*.out
+*.log
+plots/
+wandb/
+data/
+__pycache__/

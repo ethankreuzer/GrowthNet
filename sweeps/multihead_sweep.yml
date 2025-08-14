@@ -1,0 +1,56 @@
+project: GrowthCurve MultiHead model
+entity: ethan_personal
+
+command:
+  - accelerate
+  - launch
+  - --num_processes=3
+  - /home/ethan2/GrowthCurve/experiments/MultiHead/sweep_multihead.py
+  - ${args}                # W&B will expand flags here
+
+method: bayes
+metric:
+  name: AP+AUC+Pearson-MAE
+  goal: maximize
+
+parameters:
+  
+  encoding:
+    values: ['log+raw']
+
+  weight_decay:
+    distribution: log_uniform_values
+    min: 0.000001
+    max: 0.1
+  seed:
+    values: [42]
+  loss_lambda:
+    distribution: log_uniform_values
+    min: 0.1
+    max: 10
+  min_lr:
+    distribution: log_uniform_values
+    min: 0.000000001
+    max: 0.000001
+  learning_rate:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.01
+  dropout_rate:
+    distribution: uniform
+    min: 0.0
+    max: 0.6
+  active_fraction:
+    distribution: uniform
+    min: 0.15
+    max: 0.75
+  batch_size:
+    values: [128,256,512,1024]
+  epochs:
+    values: [25]
+  trunk_layers:  {values: [5]}
+  trunk_dim:     {values: [64]}
+  reg_layers:    {values: [1]}
+  reg_hidden:    {values: [16]}
+  cls_layers:    {values: [1]}
+  cls_hidden:    {values: [16]}
