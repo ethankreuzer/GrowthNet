@@ -137,7 +137,7 @@ class PerCompoundDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         meta = self._metas[idx]
 
-        #t_arr = np.empty(self.k, dtype=np.float32)
+        t_arr = np.empty(self.k, dtype=np.float32)
         t_enc_arr = np.empty((self.k, 2 * self.num_fourier), dtype=np.float32)
         c_arr = np.empty(self.k, dtype=np.float32)
         y_reg = np.empty(self.k, dtype=np.float32)
@@ -152,7 +152,6 @@ class PerCompoundDataset(Dataset):
                 c = float(meta.c_vals[0]) #should be 50
 
                 y_r, y_c = self. _interpolate_single_conc(meta, t_samp=t, c_samp=c)  # placeholder
-
 
             else:
                 
@@ -176,19 +175,20 @@ class PerCompoundDataset(Dataset):
                 t_enc_arr[i, 2*j]   = np.sin(angle)
                 t_enc_arr[i, 2*j+1] = np.cos(angle)
             
-            c_arr[i], y_reg[i], y_cls[i] = c, y_r, y_c
+            c_arr[i], y_reg[i], y_cls[i], t_arr[i] = c, y_r, y_c, t
 
 
         # Convert per-family features to tensors
         features_by_family = {fam: torch.from_numpy(vec) for fam, vec in meta.fps_by_family.items()}
 
-        
 
 
         return {
             'compound': meta.compound,
             'smiles': meta.smiles,
             'single_conc': meta.single_conc,
+            'is_active_at_12_50': meta.is_active_at_12_50,
+            't_raw': t_arr,
             't_fourier': torch.from_numpy(t_enc_arr),
             'c_raw': torch.from_numpy(c_arr),
             "c_log": torch.from_numpy(np.log(c_arr)),
@@ -372,6 +372,58 @@ class PerCompoundDataset(Dataset):
 
         return od_hat, pred_label, p_active
 
+class ExplicitDataset(Dataset):
+    """
+    Test dataset that returns observed OD and label values
+    without interpolation. One item = one (compound, t, c) row.
+    """
+
+    def __init__(self, df: pd.DataFrame, num_fourier: int):
+        self.df = df.reset_index(drop=True)
+        self.max_time = df["Timepoint"].max()
+        self.num_fourier = int(num_fourier)
+
+        # Collect fingerprint families
+        self.fp_cols_by_family = sorted(
+            [col for col in df.columns if col.endswith("_fp")]
+        )
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        row = self.df.iloc[idx]
+
+        # Raw values
+        t = float(row["Timepoint"])
+        c = float(row["Concentration"])
+        od = float(row["OD"])
+        label = int(row["is_Active"])
+
+        # Fourier time encoding
+        t_enc = np.zeros(2 * self.num_fourier, dtype=np.float32)
+        for j, k_freq in enumerate(range(1, self.num_fourier + 1)):
+            angle = 2 * np.pi * k_freq * t / self.max_time
+            t_enc[2 * j] = np.sin(angle)
+            t_enc[2 * j + 1] = np.cos(angle)
+
+        # Fingerprints
+        features_by_family = {
+            fam: torch.tensor(row[fam], dtype=torch.float32)
+            for fam in self.fp_cols_by_family
+        }
+
+        return {
+            "compound": row["Compound"],
+            "smiles": row["Smiles"],
+            "t_raw": torch.tensor(t, dtype=torch.float32),
+            "t_fourier": torch.tensor(t_enc, dtype=torch.float32),
+            "c_raw": torch.tensor(c, dtype=torch.float32),
+            "c_log": torch.tensor(np.log(c), dtype=torch.float32),
+            "y_reg": torch.tensor(od, dtype=torch.float32),
+            "y_cls": torch.tensor(label, dtype=torch.float32),
+            "features_by_family": features_by_family,
+        }
 
 def custom_collate(batch):
         """
@@ -400,4 +452,3 @@ def custom_collate(batch):
         # Add fingerprints back
         collated['features_by_family'] = features_by_family
         return collated
-
