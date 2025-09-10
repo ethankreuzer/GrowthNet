@@ -13,29 +13,30 @@ import warnings
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import random
 import math
-from typing import Literal
-from typing import Callable
-from accelerate import Accelerator  
+from typing import Literal, Callable
+from accelerate import Accelerator 
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from data_class import PerCompoundDataset, ExplicitDataset, custom_collate
+import pickle
 
 from scipy.stats import pearsonr, spearmanr
 from sklearn.metrics import (
-    r2_score,
     roc_auc_score,
     average_precision_score,
-    accuracy_score,
-    precision_score,
     recall_score,
     f1_score,
-    confusion_matrix,
     mean_absolute_error
 )
 
-import os, torch, subprocess, textwrap
+import subprocess, textwrap
 print("CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
 print("torch.cuda.device_count():", torch.cuda.device_count())
 print(textwrap.dedent(subprocess.check_output("nvidia-smi -L", shell=True, text=True)))
 
 
+# ─────────────────────────────────────────────────────────────
+# MODEL
+# ─────────────────────────────────────────────────────────────
 class MultiHeadNet(nn.Module):
     def __init__(self,
                  input_dim: int,
@@ -47,7 +48,7 @@ class MultiHeadNet(nn.Module):
                  cls_hidden: int,
                  dropout_rate: float):
         super().__init__()
-        # ── Shared trunk ─────────────────────────────────────────────
+        # Shared trunk
         trunk = []
         prev_dim = input_dim
         for _ in range(trunk_layers):
@@ -59,45 +60,34 @@ class MultiHeadNet(nn.Module):
             prev_dim = trunk_dim
         self.trunk = nn.Sequential(*trunk)
 
-        # ── Regression head ─────────────────────────────────────────
+        # Regression head
         reg = []
         prev = trunk_dim
         for _ in range(reg_layers):
-            reg += [
-                nn.Linear(prev, reg_hidden),
-                nn.ReLU(inplace=True),
-                #nn.Dropout(dropout_rate),
-            ]
+            reg += [nn.Linear(prev, reg_hidden), nn.ReLU(inplace=True)]
             prev = reg_hidden
         reg += [nn.Linear(prev, 1)]
         self.reg_head = nn.Sequential(*reg)
 
-        # ── Classification head ────────────────────────────────────
+        # Classification head
         cls = []
         prev = trunk_dim
         for _ in range(cls_layers):
-            cls += [
-                nn.Linear(prev, cls_hidden),
-                nn.ReLU(inplace=True),
-                #nn.Dropout(dropout_rate),
-            ]
+            cls += [nn.Linear(prev, cls_hidden), nn.ReLU(inplace=True)]
             prev = cls_hidden
         cls += [nn.Linear(prev, 1)]
         self.cls_head = nn.Sequential(*cls)
 
     def forward(self, x: torch.Tensor):
-        """
-        x: Tensor of shape (N, input_dim)
-        Returns:
-            reg_out: Tensor of shape (N,)       # regression output
-            cls_logits: Tensor of shape (N,)    # pre-sigmoid classification logit
-        """
         features = self.trunk(x)
         reg_out = self.reg_head(features)
         cls_logits = self.cls_head(features)
         return reg_out.squeeze(-1), cls_logits.squeeze(-1)
-    
 
+
+# ─────────────────────────────────────────────────────────────
+# METRICS
+# ─────────────────────────────────────────────────────────────
 
 def r2_np(y_true, y_pred):
     y_mean = y_true.mean()
@@ -106,52 +96,29 @@ def r2_np(y_true, y_pred):
     return 0.0 if np.isclose(tss, 0) else 1 - (sse / tss)
 
 def pearson_np(y_true, y_pred):
-    # if either vector is constant, return zero
     if np.std(y_true) == 0 or np.std(y_pred) == 0:
         return 0.0
-    # suppress any divide/invalid warnings inside corrcoef
     with np.errstate(divide='ignore', invalid='ignore'):
         return float(np.corrcoef(y_true, y_pred)[0,1])
 
 def spearman_np(y_true, y_pred):
-    # if constant, return zero
     if np.allclose(y_true, y_true.mean()) or np.allclose(y_pred, y_pred.mean()):
         return 0.0
-    # suppress any underlying warnings from scipy
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         corr, _ = spearmanr(y_true, y_pred)
     return float(corr)
 
-def compute_weighted_metric(
+
+def compute_weighted_metric_old(
     model: nn.Module,
     df: pd.DataFrame,
-    cols_rem: list[str],
+    feature_cols: list[str],
     fctn: Callable[[np.ndarray, np.ndarray], float],
     *,
     target_col: str = "OD",
     head: Literal["reg", "cls"] = "reg",
 ) -> float:
-    """
-    Compute a weighted-average metric over (Concentration,Timepoint) cells.
-    
-    Parameters
-    ----------
-    model
-      A PyTorch model that returns either a Tensor (regression) or a tuple
-      (reg_tensor, cls_logits_tensor).
-    df
-      DataFrame containing 'Concentration', 'Timepoint', and `target_col`.
-    cols_rem
-      Columns to drop before passing to the model.
-    fctn
-      A function f(y_true: np.ndarray, y_pred: np.ndarray) -> float
-      (e.g. r2_np, roc_auc_score, lambda y,p: f1_score(y, p>0.5), etc.)
-    target_col
-      Which column in `df` holds the true labels for this metric.
-    head
-      "reg" → use the model’s first output; "cls" → use the second output + sigmoid.
-    """
     unique_concs = sorted(df["Concentration"].unique())
     unique_times = sorted(df["Timepoint"].unique())
 
@@ -172,31 +139,21 @@ def compute_weighted_metric(
                 stats.loc[c, t] = np.nan
                 continue
 
-            # true labels
             y_true = df.loc[idx, target_col].to_numpy()
 
             if head == "cls" and len(np.unique(y_true)) < 2:
-                stats.loc[c, t]   = np.nan   # mark metric undefined
-                counts.loc[c, t]  = 0        # drop its samples from denominator
+                stats.loc[c, t] = np.nan
+                counts.loc[c, t] = 0
                 continue
 
-            # prepare inputs
-            X = df.loc[idx].drop(columns=cols_rem).to_numpy()
+            X = df.loc[idx, feature_cols].to_numpy()
             X_t = torch.tensor(X, dtype=torch.float32, device=device)
 
-            # forward pass
             with torch.inference_mode():
-                out = model(X_t)
-                if isinstance(out, tuple):
-                    reg_out, cls_logits = out
-                else:
-                    reg_out, cls_logits = out, None
-
+                reg_out, cls_logits = model(X_t)
                 if head == "reg":
                     y_pred_t = reg_out
                 elif head == "cls":
-                    if cls_logits is None:
-                        raise ValueError("Model did not return classification logits")
                     y_pred_t = torch.sigmoid(cls_logits)
                 else:
                     raise ValueError(f"Unknown head: {head!r}")
@@ -204,71 +161,78 @@ def compute_weighted_metric(
             y_pred = y_pred_t.cpu().numpy().squeeze()
             stats.loc[c, t] = float(fctn(y_true, y_pred))
 
-    # now do the same weighting as before
     valid        = stats.notna()
     weighted_sum = (stats.where(valid) * counts.where(valid)).sum().sum()
     total_cnt    = counts.where(valid).sum().sum()
     return weighted_sum / total_cnt if total_cnt > 0 else np.nan
 
 
-
-def oversample_actives_to_fraction(df: pd.DataFrame,
-                                   fraction: float,
-                                   random_state: int | None = None) -> pd.DataFrame:
-
-    out_parts = []
-    group_cols = ['Concentration', 'Timepoint']
+def batch_to_tensor(batch: dict, device: torch.device):
     
-    for (c, t), group in df.groupby(group_cols, sort=False):
-        act  = group[group['is_Active'] == 1]
-        inact= group[group['is_Active'] == 0]
-        n     = len(group)
-        k     = len(act)
-        
-        # if already at or above target (or no actives to sample), leave as is:
-        if k == 0 or k / n >= fraction:
-            out_parts.append(group)
-            continue
-        
-        # compute how many extra needed so that (k + extra)/(n + extra) = fraction
-        extra = math.ceil((fraction * n - k) / (1 - fraction))
-        
-        # sample `extra` actives with replacement
-        extra_act = act.sample(n=extra, replace=True, random_state=random_state)
-        
-        out_parts.append(pd.concat([group, extra_act], ignore_index=True))
-    
-    return pd.concat(out_parts, ignore_index=True)
-
-def apply_concentration_encoding(df, encoding):
-    
-    max_time = np.log(df['Concentration'].max())
-
-    if encoding == 'raw':
-        df['conc_enc'] = df['Concentration']
-
-    elif encoding == 'log':
-        df['conc_enc_log'] = np.log(df['Concentration'])
-
-    elif encoding == 'poly':
-        df['conc_enc']     = df['Concentration']
-        df['conc_squared'] = df['Concentration'] ** 2
-        df['conc_cubed']   = df['Concentration'] ** 3
-
-    elif encoding == 'fourier':
-        for k in range(1, 4):
-            df[f'conc_sin_{k}'] = np.sin(2 * np.pi * k * np.log(df['Concentration']) / max_time)
-            df[f'conc_cos_{k}'] = np.cos(2 * np.pi * k * np.log(df['Concentration']) / max_time)
-
-    elif encoding == 'log+raw':
-        df['conc_enc_log'] = np.log(df['Concentration'])
-        df['conc_enc']     = df['Concentration']
-
-
+    if batch["t_fourier"].ndim == 3:       # (N, k, 2*num_fourier) → training
+        N, k, _ = batch["t_fourier"].shape
+        t_feats = batch["t_fourier"].reshape(N * k, -1)
+        c_raw   = batch["c_raw"].reshape(N * k, 1)
+        c_log   = batch["c_log"].reshape(N * k, 1)
+        y_reg   = batch["y_reg"].reshape(N * k)
+        y_cls   = batch["y_cls"].reshape(N * k).float()
+        repeats = k
+    elif batch["t_fourier"].ndim == 2:     # (N, 2*num_fourier) → testing
+        N, _   = batch["t_fourier"].shape
+        t_feats = batch["t_fourier"]
+        c_raw   = batch["c_raw"].unsqueeze(1)   # (N,1)
+        c_log   = batch["c_log"].unsqueeze(1)   # (N,1)
+        y_reg   = batch["y_reg"]
+        y_cls   = batch["y_cls"].float()
+        repeats = 1
     else:
-        raise ValueError(f"Unknown encoding type: {encoding}")
+        raise ValueError(f"Unexpected t_fourier shape {batch['t_fourier'].shape}")
 
-    return df
+    feats = [t_feats, c_raw, c_log]
+
+    for fam in sorted(batch["features_by_family"].keys()):
+        feats.append(batch["features_by_family"][fam].repeat_interleave(repeats, dim=0))
+
+    # Ensure all tensors are on the same device
+    feats = [f.to(device) for f in feats]
+
+    X = torch.cat(feats, dim=1)
+    return X, y_reg.to(device), y_cls.to(device)
+
+
+def compute_weighted_metric(
+   
+    model: nn.Module,
+    data: dict,
+    metric_fn: Callable[[np.ndarray, np.ndarray], float],
+    *,
+    head: Literal["reg", "cls"] = "reg",
+    batch_size: int = 128,
+    device: torch.device = torch.device("cpu"),
+) -> float:
+    
+    model.eval()
+    all_true, all_pred = [], []
+
+    with torch.inference_mode():
+    
+        Xb, yb_reg, yb_cls = batch_to_tensor(data, device)  # feature_cols arg is unused now
+        reg_out, cls_logits = model(Xb)
+
+        if head == "reg":
+            y_true, y_pred = yb_reg.cpu().numpy(), reg_out.cpu().numpy()
+        else:  # classification
+            y_true = yb_cls.cpu().numpy()
+            y_pred = torch.sigmoid(cls_logits).cpu().numpy()
+
+        all_true.append(y_true)
+        all_pred.append(y_pred)
+
+    y_true = np.concatenate(all_true)
+    y_pred = np.concatenate(all_pred)
+    return metric_fn(y_true, y_pred)
+
+
 
 def train():
 
@@ -295,70 +259,34 @@ def train():
     torch.backends.cudnn.benchmark = False
     
     sweep_id = run.sweep_id  
-    
 
-    # ─── Device ─────────────────────────────────────────────────────────────
     device = accelerator.device
 
     # ─── Load & augment DataFrames ─────────────────────────────────────────
-    df_train = pd.read_pickle("/home/ethan2/GrowthCurve/data/train/df_well_train_mad_4.pkl")
-    #df_train = pd.read_pickle("/home/ethan2/GrowthCurve/data/train/df_well_train_mad_4_undersampled_conc_50_time_6_12.pkl")
-
-    df_train = oversample_actives_to_fraction(df_train, fraction=config.active_fraction, random_state=42)
-    df_test  = pd.read_pickle("/home/ethan2/GrowthCurve/data/test/df_well_test_mad_4.pkl")
-    #df_test  = pd.read_pickle("/home/ethan2/GrowthCurve/data/test/df_well_test_mad_4_undersampled_conc_50_time_6_12.pkl")
-
-    #over sample actvies at every timepoint/concentration
-
     
+    df_train = pd.read_pickle("/home/ethan2/GrowthCurve/data/train/df_well_train_mad_4.pkl")
+    
+    df_test  = pd.read_pickle("/home/ethan2/GrowthCurve/data/test/df_well_test_mad_4.pkl")   
+    
+    with open("/home/ethan2/GrowthCurve/data/test/dict_test_fourier_k_3.pkl", "rb") as f:
+        dict_test = pickle.load(f) 
 
-    for df in (df_train, df_test):
+    with open("/home/ethan2/GrowthCurve/data/test/dict_test_fourier_k_3_conc_0_781.pkl", "rb") as f:
+        dict_test_conc_0_781 = pickle.load(f) 
 
-        max_time = np.log(df['Timepoint'].max())
+    with open("/home/ethan2/GrowthCurve/data/test/dict_test_fourier_k_3_conc_3_13.pkl", "rb") as f:
+        dict_test_conc_3_13 = pickle.load(f)
 
-        for k in range(1, 4):
-            df[f'time_sin_{k}'] = np.sin(2 * np.pi * k * np.log(df['Timepoint']) / max_time)
-            df[f'time_cos_{k}'] = np.cos(2 * np.pi * k * np.log(df['Timepoint']) / max_time)
-        df = apply_concentration_encoding(df, config.encoding)
-        #df['raw_conc']     = np.log1p(df['Concentration'])
-        #df['time']         = df['Timepoint']
-        #df['time_squared'] = df['Timepoint'] ** 2
-        #df['time_cubed']   = df['Timepoint'] ** 3
+    with open("/home/ethan2/GrowthCurve/data/test/dict_test_fourier_k_3_conc_12_50.pkl", "rb") as f:
+        dict_test_conc_12_50 = pickle.load(f)
 
-    df_train = df_train[df_train['Concentration'].isin([0.2, 1.2, 3.13, 7.9, 50])].reset_index(drop=True)
-    df_test_conc_0_781 = df_test[df_test['Concentration'] == 0.781].reset_index(drop=True)
-    df_test_conc_12_50 = df_test[df_test['Concentration'] == 12.5].reset_index(drop=True)
+    Xte, yte_reg, yte_cls = batch_to_tensor(dict_test, device)
 
-    # ─── Split off features & targets ────────────────────────────────────────
-    cols_rem = ['Well','Plate_ID','Compound','Control_Label',
-                'Smiles','is_Active','scaffold','OD',
-                'Concentration','Timepoint']
 
-    X_train = df_train.drop(columns=cols_rem).to_numpy()
-    X_test  = df_test .drop(columns=cols_rem).to_numpy()
-
-    y_train_reg = df_train['OD'].to_numpy().reshape(-1,1)
-    y_test_reg  = df_test ['OD'].to_numpy().reshape(-1,1)
-
-    y_train_cls = df_train['is_Active'].astype(float).to_numpy().reshape(-1,1)
-    y_test_cls  = df_test ['is_Active'].astype(float).to_numpy().reshape(-1,1)
-
-    # ─── Tensors & DataLoader ───────────────────────────────────────────────
-    Xtr = torch.tensor(X_train, dtype=torch.float32, device=device)
-    Xte = torch.tensor(X_test,  dtype=torch.float32, device=device)
-    ytr_reg = torch.tensor(y_train_reg, dtype=torch.float32, device=device).squeeze(-1)
-    yte_reg = torch.tensor(y_test_reg,  dtype=torch.float32, device=device).squeeze(-1)
-    ytr_cls = torch.tensor(y_train_cls, dtype=torch.float32, device=device).squeeze(-1)
-    yte_cls = torch.tensor(y_test_cls,  dtype=torch.float32, device=device).squeeze(-1)
-
-    train_ds = torch.utils.data.TensorDataset(Xtr, ytr_reg, ytr_cls)
-    train_loader = torch.utils.data.DataLoader(
-        train_ds, batch_size=config.batch_size, shuffle=True, drop_last=True
-    )
 
     # ─── Model + Losses + Optimizer ─────────────────────────────────────────
     model = MultiHeadNet(
-        input_dim   = Xtr.shape[1],
+        input_dim   = Xte.shape[1],
         trunk_layers = config.trunk_layers,
         trunk_dim    = config.trunk_dim,
         reg_layers   = config.reg_layers,
@@ -368,20 +296,17 @@ def train():
         dropout_rate = config.dropout_rate,
     ).to(device)
 
-
     mse_loss = nn.MSELoss()
     bce_loss = nn.BCEWithLogitsLoss()
     optimizer = optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
-
     scheduler = CosineAnnealingLR(
-        optimizer,
-        T_max=config.epochs,      # number of epochs for one annealing cycle
-        eta_min=config.min_lr    # final lower bound
-    )
+            optimizer,
+            T_max=config.epochs,      # number of epochs for one annealing cycle
+            eta_min=config.min_lr    # final lower bound
+        )
 
-    model, optimizer, train_loader, scheduler = accelerator.prepare(
-        model, optimizer, train_loader, scheduler
-    )
+
+    
 
     run_id = wandb.run.id.replace(":", "_")
     best_metric   = -float("inf")          
@@ -392,29 +317,51 @@ def train():
         os.makedirs(outdir, exist_ok=True)                   
         best_ckpt = os.path.join(outdir,f"multihead_{run_id}_best.pt")
 
+
     # ─── Training Loop ─────────────────────────────────────────────────────
     for epoch in range(1, config.epochs + 1):
+       
+        
+        train_ds = PerCompoundDataset(df_train, k=config.samples, seed=None, num_fourier=3)
+        num_actives = sum(meta.is_active_at_12_50 for meta in train_ds._metas)
+        num_inactives = len(train_ds) - num_actives
+
+        weights=[]
+
+        for meta in train_ds._metas:
+            if meta.is_active_at_12_50:
+                weights.append(config.active_fraction / num_actives)
+            else:
+                weights.append((1.0 - config.active_fraction) / num_inactives)
+        
+        sampler = WeightedRandomSampler(weights, num_samples=len(train_ds), replacement=True)
+        
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=config.batch_size,
+            sampler=sampler,
+            collate_fn=custom_collate
+        )
+
+        model, optimizer, train_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, scheduler
+    )
         model.train()
+
         train_reg_loss = 0.0
         train_cls_loss = 0.0
 
-        for Xb, yb_reg, yb_cls in train_loader:
-            
+        for batch in train_loader:
+
+            Xb, yb_reg, yb_cls = batch_to_tensor(batch, device)
             optimizer.zero_grad()
             out_reg, out_cls_logits = model(Xb)
-    
             # classification loss on all examples
             loss_cls = bce_loss(out_cls_logits.squeeze(-1), yb_cls)
-    
-            
-            #active_mask = (yb_cls == 1)
-            
+            #active_mask = (yb_cls == 1) COME BACK TO THIS
             loss_reg = mse_loss(out_reg, yb_reg) #regresssing on everything not just actives, inactive performsnce was too poor
-
             # total loss
             loss = loss_cls + config.loss_lambda * loss_reg
-
-            #loss.backward()
             accelerator.backward(loss)
             optimizer.step() 
 
@@ -458,7 +405,6 @@ def train():
 
             # your new “active‐only total loss”
             val_loss_act = val_reg_loss_act + val_cls_loss_act
-
 
             # ─── 1) Entire TRAIN set ─────────────────────────────────────────
             r2_train      = compute_weighted_metric(model, df_train, cols_rem, r2_np,      head="reg")
@@ -511,7 +457,6 @@ def train():
             mae_val_act = compute_weighted_metric(model, df_test_act, cols_rem, mean_absolute_error, head="reg")
             r2_val_act      = compute_weighted_metric(model, df_test_act, cols_rem, r2_np,      head="reg")
             pearson_val_act = compute_weighted_metric(model, df_test_act, cols_rem, pearson_np, head="reg")
-            spearman_val_act= compute_weighted_metric(model, df_test_act, cols_rem, spearman_np,head="reg")
 
             # ─── 4) Inactive‐only VAL set ─────────────────────────────────────────
             df_test_inact = df_test[df_test["is_Active"] == 0]
@@ -519,28 +464,31 @@ def train():
             mae_val_inact = compute_weighted_metric(model, df_test_inact, cols_rem, mean_absolute_error, head="reg")
             r2_val_inact      = compute_weighted_metric(model, df_test_inact, cols_rem, r2_np,      head="reg")
             pearson_val_inact = compute_weighted_metric(model, df_test_inact, cols_rem, pearson_np, head="reg")
-            spearman_val_inact= compute_weighted_metric(model, df_test_inact, cols_rem, spearman_np,head="reg")
 
             # ─── 5)  VAL set Concentratio 0.781─────────────────────────────────────────
             mae_val_0_781 = compute_weighted_metric(model, df_test_conc_0_781, cols_rem, mean_absolute_error, head="reg")
             r2_val_0_781     = compute_weighted_metric(model, df_test_conc_0_781, cols_rem, r2_np,      head="reg")
             pearson_val_0_781 = compute_weighted_metric(model, df_test_conc_0_781, cols_rem, pearson_np, head="reg")
-            spearman_val_0_781= compute_weighted_metric(model, df_test_conc_0_781, cols_rem, spearman_np,head="reg")
 
-             # ─── 6)  VAL set Concentratio 12.5─────────────────────────────────────────
+            # ─── 6)  VAL set Concentratio 3.13─────────────────────────────────────────
+
+            mae_val_3_13 = compute_weighted_metric(model, df_test_conc_3_13, cols_rem, mean_absolute_error, head="reg")
+            r2_val_3_13     = compute_weighted_metric(model, df_test_conc_3_13, cols_rem, r2_np,      head="reg")
+            pearson_val_3_13 = compute_weighted_metric(model, df_test_conc_3_13, cols_rem, pearson_np, head="reg")      
+
+            # ─── 7)  VAL set Concentratio 12.5─────────────────────────────────────────
             mae_val_12_50 = compute_weighted_metric(model, df_test_conc_12_50, cols_rem, mean_absolute_error, head="reg")
             r2_val_12_50     = compute_weighted_metric(model, df_test_conc_12_50, cols_rem, r2_np,      head="reg")
             pearson_val_12_50 = compute_weighted_metric(model, df_test_conc_12_50, cols_rem, pearson_np, head="reg")
-            spearman_val_12_50= compute_weighted_metric(model, df_test_conc_12_50, cols_rem, spearman_np,head="reg")
+
 
             #Goal Metric
 
             AP_AUC_Pearson_MAE = ap_val+auc_val+pearson_val_act-mae_val_act
 
-            current_metric = AP_AUC_Pearson_MAE    # whatever you called it above
 
-            if current_metric > best_metric:
-                best_metric = current_metric
+            if AP_AUC_Pearson_MAE > best_metric:
+                best_metric = AP_AUC_Pearson_MAE
                 
                 best_state = copy.deepcopy(accelerator.unwrap_model(model).state_dict())
                 
@@ -589,7 +537,6 @@ def train():
                 
                 "train_r2":       r2_train,
                 "train_pearson":  pearson_train,
-                "train_spearman": spearman_train,
                 "train_ap":       ap_train,
                 "train_f1":       f1_train,
                 "train_auc":      auc_train,
@@ -598,7 +545,6 @@ def train():
                 ### VALIDATION SET
                 "val_r2":         r2_val,
                 "val_pearson":    pearson_val,
-                "val_spearman":   spearman_val,
                 "val_ap":         ap_val,
                 "val_f1":         f1_val,
                 "val_auc":        auc_val,
@@ -608,29 +554,30 @@ def train():
                 "val_r2_act":       r2_val_act,
                 "mae_val_act": mae_val_act,
                 "val_pearson_act":  pearson_val_act,
-                "val_spearman_act": spearman_val_act,
 
                 ###INACTIVE Validation
                 "val_r2_inact":       r2_val_inact,
                 "val_pearson_inact":  pearson_val_inact,
-                "val_spearman_inact": spearman_val_inact,
                 "mae_val_inact": mae_val_inact,
 
-
-                ###Metric to optimize
-                "AP+AUC+Pearson-MAE": AP_AUC_Pearson_MAE,
 
                 ### 0.781 Conc validation metrics
                 "mae_val_0_781": mae_val_0_781,
                 "r2_val_0_781": r2_val_0_781,
                 "pearson_val_0_781":pearson_val_0_781,
-                "spearman_val_0_781": spearman_val_0_781,
+
+                ### 3.13 Conc validation metrics
+                "mae_val_3_13": mae_val_3_13,
+                "r2_val_3_13": r2_val_3_13,
+                "pearson_val_3_13":pearson_val_3_13,
 
                 ### 12.50 Conc validation metrics
                 "mae_val_12_50": mae_val_12_50,
                 "r2_val_12_50": r2_val_12_50,
                 "pearson_val_12_50":pearson_val_12_50,
-                "spearman_val_12_50": spearman_val_12_50,
+
+                ###Metric to optimize
+                "AP+AUC+Pearson-MAE": AP_AUC_Pearson_MAE,
 
             })
 
