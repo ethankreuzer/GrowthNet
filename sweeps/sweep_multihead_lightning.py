@@ -1,16 +1,29 @@
 #!/usr/bin/env python
 # coding: utf-8
-
 import os, random, warnings, pickle
+os.environ.setdefault("WANDB_START_METHOD", "thread")  # safer under DDP
+
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
-
+import torch.distributed as dist
+import json
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.strategies import DDPStrategy
+
+
+if os.environ.get("RANK", "0") != "0":
+    os.environ["WANDB_DISABLED"] = "true"
+
+# (optional but helpful on HPC)
+os.environ.setdefault("WANDB__SERVICE_WAIT", "600")
+os.environ.setdefault("WANDB_HTTP_TIMEOUT", "300")
+os.environ.setdefault("WANDB_DISABLE_CODE", "true")
+os.environ.setdefault("WANDB_SILENT", "true")
 
 import wandb
 from scipy.stats import spearmanr
@@ -25,6 +38,31 @@ from sklearn.metrics import (
 # Import your custom datasets and collate
 # ─────────────────────────────────────────────────────────────
 from data_class import PerCompoundDataset, ExplicitDataset, custom_collate
+
+
+# --- add imports ---
+import argparse
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    # match the sweep yaml keys
+    p.add_argument("--samples", type=int, default=6)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--loss_lambda", type=float, default=5.0)
+    p.add_argument("--min_lr", type=float, default=1e-7)
+    p.add_argument("--learning_rate", type=float, default=1e-3)
+    p.add_argument("--dropout_rate", type=float, default=0.2)
+    p.add_argument("--active_fraction", type=float, default=0.6)
+    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--epochs", type=int, default=25)
+    p.add_argument("--trunk_layers", type=int, default=5)
+    p.add_argument("--trunk_dim", type=int, default=64)
+    p.add_argument("--reg_layers", type=int, default=1)
+    p.add_argument("--reg_hidden", type=int, default=16)
+    p.add_argument("--cls_layers", type=int, default=1)
+    p.add_argument("--cls_hidden", type=int, default=16)
+    return vars(p.parse_args())
 
 
 # ─────────────────────────────────────────────────────────────
@@ -139,13 +177,13 @@ class MultiHeadLightning(pl.LightningModule):
         self.save_hyperparameters(config)
         self.model = MultiHeadNet(
             input_dim   = input_dim,
-            trunk_layers = config.trunk_layers,
-            trunk_dim    = config.trunk_dim,
-            reg_layers   = config.reg_layers,
-            reg_hidden   = config.reg_hidden,
-            cls_layers   = config.cls_layers,
-            cls_hidden   = config.cls_hidden,
-            dropout_rate = config.dropout_rate,
+            trunk_layers = config['trunk_layers'],
+            trunk_dim    = config['trunk_dim'],
+            reg_layers   = config['reg_layers'],
+            reg_hidden   = config['reg_hidden'],
+            cls_layers   = config['cls_layers'],
+            cls_hidden   = config['cls_hidden'],
+            dropout_rate = config['dropout_rate'],
         )
         self.mse_loss = nn.MSELoss()
         self.bce_loss = nn.BCEWithLogitsLoss()
@@ -161,9 +199,10 @@ class MultiHeadLightning(pl.LightningModule):
         loss_cls = self.bce_loss(out_cls_logits.squeeze(-1), yb_cls)
         loss = loss_cls + self.hparams.loss_lambda * loss_reg
 
-        self.log("train/reg_loss", loss_reg, prog_bar=True)
-        self.log("train/cls_loss", loss_cls, prog_bar=True)
-        self.log("train/loss", loss, prog_bar=True)
+        self.log("train/reg_loss", loss_reg, on_step=True, on_epoch=False, sync_dist=True, prog_bar=False)
+        self.log("train/cls_loss", loss_cls, on_step=True, on_epoch=False, sync_dist=True, prog_bar=False)
+        self.log("train/loss",     loss,     on_step=True, on_epoch=False, sync_dist=True, prog_bar=True)
+        
         return loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
@@ -190,6 +229,10 @@ class MultiHeadLightning(pl.LightningModule):
         self.log(f"{name}/cls_loss", val_cls_loss, prog_bar=True, on_epoch=True)
         self.log(f"{name}/loss", val_loss, prog_bar=True, on_epoch=True)
         self.log(f"{name}/loss_act", val_loss_act, prog_bar=False, on_epoch=True)
+
+        if dataloader_idx == 0:
+            self.log("val_loss", val_loss, prog_bar=True, on_epoch=True, sync_dist=True)
+
 
         # Extra metrics
         y_true_reg, y_true_cls = yb_reg.cpu().numpy(), yb_cls.cpu().numpy()
@@ -236,59 +279,68 @@ class GrowthCurveDataModule(pl.LightningDataModule):
 
     def setup(self, stage=None):
         self.train_ds = PerCompoundDataset(
-            self.df_train, k=self.config.samples, seed=None, num_fourier=3
+            self.df_train, k=self.config['samples'], seed=None, num_fourier=3
         )
 
     def train_dataloader(self):
+
+        rank = int(os.environ.get("RANK", "0"))
+        g = torch.Generator()
+        g.manual_seed(self.config['seed'] + rank)
+
         num_actives = sum(meta.is_active_at_12_50 for meta in self.train_ds._metas)
         num_inactives = len(self.train_ds) - num_actives
         weights = [
-            (self.config.active_fraction / num_actives if meta.is_active_at_12_50
-             else (1.0 - self.config.active_fraction) / num_inactives)
+            (self.config['active_fraction'] / num_actives if meta.is_active_at_12_50
+             else (1.0 - self.config['active_fraction']) / num_inactives)
             for meta in self.train_ds._metas
         ]
-        sampler = WeightedRandomSampler(weights, num_samples=len(self.train_ds), replacement=True)
+        sampler = WeightedRandomSampler(weights, num_samples=len(self.train_ds), replacement=True, generator=g)
+        
         return DataLoader(self.train_ds,
-                          batch_size=self.config.batch_size,
+                          batch_size=self.config['batch_size'],
                           sampler=sampler,
                           collate_fn=custom_collate,
+                          shuffle=False,
                           num_workers=6,
                           pin_memory=True)
-
     def val_dataloader(self):
-        # Treat each dict as a dataset of length 1
+
         class DictDataset(torch.utils.data.Dataset):
-            def __init__(self, data_dict):
-                self.data = data_dict
-            def __len__(self):
-                return 1
-            def __getitem__(self, idx):
-                return self.data
+            def __init__(self, data_dict): self.data = data_dict
+            def __len__(self): return 1
+            def __getitem__(self, idx): return self.data
+
+        identity = lambda batch: batch[0]  # don’t stack into a batch
 
         return [
-            DataLoader(DictDataset(self.dict_val_main), batch_size=1),
-            DataLoader(DictDataset(self.dict_val_0_781), batch_size=1),
-            DataLoader(DictDataset(self.dict_val_3_13), batch_size=1),
-            DataLoader(DictDataset(self.dict_val_12_50), batch_size=1),
+            DataLoader(DictDataset(self.dict_val_main),  batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True),
+            DataLoader(DictDataset(self.dict_val_0_781), batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True),
+            DataLoader(DictDataset(self.dict_val_3_13),  batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True),
+            DataLoader(DictDataset(self.dict_val_12_50), batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True),
         ]
-
+    
 
 
 # ─────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────
+
+def is_rank_zero() -> bool:
+    return int(os.environ.get("RANK", "0")) == 0
+
 def main():
-    run = wandb.init(project="GrowthCurve_MultiHead")
-    config = run.config
+    # Parse sweep-injected CLI args
+    config = parse_args()
 
-    # Seeding
-    random.seed(config.seed)
-    np.random.seed(config.seed)
-    torch.manual_seed(config.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(config.seed)
+    # Reproducibility + matmul perf
+    pl.seed_everything(config['seed'], workers=True)
+    try:
+        torch.set_float32_matmul_precision('medium')
+    except Exception:
+        pass
 
-    # Load data
+    # ── Load data ──
     df_train = pd.read_pickle("/home/ethan2/GrowthCurve/data/train/df_well_train_mad_4.pkl")
     with open("/home/ethan2/GrowthCurve/data/test/dict_test_fourier_k_3.pkl", "rb") as f:
         dict_test = pickle.load(f)
@@ -299,29 +351,44 @@ def main():
     with open("/home/ethan2/GrowthCurve/data/test/dict_test_fourier_k_3_conc_12_50.pkl", "rb") as f:
         dict_test_conc_12_50 = pickle.load(f)
 
-    # Prepare one batch to know input_dim
+    # Infer input_dim from one prepared batch
     Xte, _, _ = batch_to_tensor(dict_test, torch.device("cpu"))
-    # Build datamodule
-    dm = GrowthCurveDataModule(config, df_train, dict_test, dict_test_conc_0_781,
-                               dict_test_conc_3_13, dict_test_conc_12_50)
 
-    # Build model
+    # DataModule & Model
+    dm = GrowthCurveDataModule(
+        config,
+        df_train,
+        dict_test,
+        dict_test_conc_0_781,
+        dict_test_conc_3_13,
+        dict_test_conc_12_50,
+    )
     model = MultiHeadLightning(input_dim=Xte.shape[1], config=config)
 
-    # Logger
-    wandb_logger = WandbLogger(project="GrowthCurve_MultiHead")
+    # Logger only on rank 0 (rank guard should be defined elsewhere)
+    wandb_logger = WandbLogger() if is_rank_zero() else None
+    if wandb_logger is not None:
+        # record sweep config on the run
+        try:
+            wandb_logger.experiment.config.update(config, allow_val_change=True)
+        except Exception:
+            pass
 
+    # Trainer (DDP over up to 3 GPUs)
     trainer = pl.Trainer(
-        max_epochs=config.epochs,
+        max_epochs=config['epochs'],
         accelerator="gpu",
-        devices="auto",
+        devices=min(3, torch.cuda.device_count()),
+        strategy=DDPStrategy(find_unused_parameters=False),
         logger=wandb_logger,
         log_every_n_steps=10,
-        replace_sampler_ddp=False,
+        enable_progress_bar=is_rank_zero(),
+        num_sanity_val_steps=0,
     )
 
+    # Train
     trainer.fit(model, datamodule=dm)
-    wandb.finish()
+
 
 
 if __name__ == "__main__":
