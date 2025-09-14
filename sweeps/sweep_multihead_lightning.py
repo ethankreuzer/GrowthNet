@@ -199,9 +199,9 @@ class MultiHeadLightning(pl.LightningModule):
         loss_cls = self.bce_loss(out_cls_logits.squeeze(-1), yb_cls)
         loss = loss_cls + self.hparams.loss_lambda * loss_reg
 
-        self.log("train/reg_loss", loss_reg, on_step=True, on_epoch=False, sync_dist=True, prog_bar=False)
-        self.log("train/cls_loss", loss_cls, on_step=True, on_epoch=False, sync_dist=True, prog_bar=False)
-        self.log("train/loss",     loss,     on_step=True, on_epoch=False, sync_dist=True, prog_bar=True)
+        self.log("train/reg_loss", loss_reg, on_step=True, on_epoch=False, sync_dist=False, prog_bar=False)
+        self.log("train/cls_loss", loss_cls, on_step=True, on_epoch=False, sync_dist=False, prog_bar=False)
+        self.log("train/loss",     loss,     on_step=True, on_epoch=False, sync_dist=False, prog_bar=True)
         
         return loss
 
@@ -209,46 +209,45 @@ class MultiHeadLightning(pl.LightningModule):
         Xb, yb_reg, yb_cls = batch_to_tensor(batch, self.device)
         pred_reg, pred_cls_logits = self(Xb)
 
-        val_reg_loss = self.mse_loss(pred_reg, yb_reg)
-        val_cls_loss = self.bce_loss(pred_cls_logits.squeeze(-1), yb_cls)
-        val_loss = val_reg_loss + val_cls_loss
-
-        active_mask = (yb_cls == 1)
-        if active_mask.sum() > 0:
-            val_reg_loss_act = self.mse_loss(pred_reg[active_mask], yb_reg[active_mask])
-            val_cls_loss_act = self.bce_loss(pred_cls_logits.squeeze(-1)[active_mask], yb_cls[active_mask])
-        else:
-            val_reg_loss_act = torch.tensor(0.0, device=self.device)
-            val_cls_loss_act = torch.tensor(0.0, device=self.device)
-        val_loss_act = val_reg_loss_act + val_cls_loss_act
+        reg_loss = self.mse_loss(pred_reg, yb_reg)
+        cls_loss = self.bce_loss(pred_cls_logits.squeeze(-1), yb_cls)
+        loss = reg_loss + cls_loss
 
         dataset_names = ["val_main", "val_0_781", "val_3_13", "val_12_50"]
         name = dataset_names[dataloader_idx]
 
-        self.log(f"{name}/reg_loss", val_reg_loss, prog_bar=True, on_epoch=True)
-        self.log(f"{name}/cls_loss", val_cls_loss, prog_bar=True, on_epoch=True)
-        self.log(f"{name}/loss", val_loss, prog_bar=True, on_epoch=True)
-        self.log(f"{name}/loss_act", val_loss_act, prog_bar=False, on_epoch=True)
-
         if dataloader_idx == 0:
-            self.log("val_loss", val_loss, prog_bar=True, on_epoch=True, sync_dist=True)
+            # ── Only for main validation set ──
+            # Split losses by active/inactive
+            active_mask = (yb_cls == 1)
+            inactive_mask = ~active_mask
 
+            if active_mask.any():
+                reg_loss_act = self.mse_loss(pred_reg[active_mask], yb_reg[active_mask])
+            else:
+                reg_loss_act = torch.tensor(0.0, device=self.device)
 
-        # Extra metrics
-        y_true_reg, y_true_cls = yb_reg.cpu().numpy(), yb_cls.cpu().numpy()
-        y_pred_reg = pred_reg.detach().cpu().numpy()
-        y_pred_cls = torch.sigmoid(pred_cls_logits).detach().cpu().numpy()
+            if inactive_mask.any():
+                reg_loss_inact = self.mse_loss(pred_reg[inactive_mask], yb_reg[inactive_mask])
+            else:
+                reg_loss_inact = torch.tensor(0.0, device=self.device)
 
-        self.log(f"{name}/pearson", pearson_np(y_true_reg, y_pred_reg))
-        self.log(f"{name}/spearman", spearman_np(y_true_reg, y_pred_reg))
+            # Log all main metrics
+            self.log(f"{name}/reg_loss", reg_loss, prog_bar=True, on_epoch=True, sync_dist=True)
+            self.log(f"{name}/cls_loss", cls_loss, prog_bar=True, on_epoch=True, sync_dist=True)
+            self.log(f"{name}/loss",     loss,     prog_bar=True, on_epoch=True, sync_dist=True)
+            self.log(f"{name}/reg_loss_actives",   reg_loss_act,   prog_bar=False, on_epoch=True, sync_dist=True)
+            self.log(f"{name}/reg_loss_inactives", reg_loss_inact, prog_bar=False, on_epoch=True, sync_dist=True)
 
-        if len(np.unique(y_true_cls)) > 1:
-            self.log(f"{name}/auc", roc_auc_score(y_true_cls, y_pred_cls))
-            self.log(f"{name}/ap", average_precision_score(y_true_cls, y_pred_cls))
-            self.log(f"{name}/f1", f1_score(y_true_cls, y_pred_cls > 0.5))
-            self.log(f"{name}/recall", recall_score(y_true_cls, y_pred_cls > 0.5))
+            # Used by early stopping callbacks etc.
+            self.log("val_loss", loss, prog_bar=True, on_epoch=True, sync_dist=True)
 
-        return val_loss
+        else:
+            # ── For the 3 subset dataloaders ──
+            self.log(f"{name}/loss", loss, prog_bar=True, on_epoch=True, sync_dist=True)
+
+        return loss
+
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(
@@ -302,7 +301,7 @@ class GrowthCurveDataModule(pl.LightningDataModule):
                           sampler=sampler,
                           collate_fn=custom_collate,
                           shuffle=False,
-                          num_workers=6,
+                          num_workers=32,
                           pin_memory=True)
     def val_dataloader(self):
 
@@ -314,10 +313,10 @@ class GrowthCurveDataModule(pl.LightningDataModule):
         identity = lambda batch: batch[0]  # don’t stack into a batch
 
         return [
-            DataLoader(DictDataset(self.dict_val_main),  batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True),
-            DataLoader(DictDataset(self.dict_val_0_781), batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True),
-            DataLoader(DictDataset(self.dict_val_3_13),  batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True),
-            DataLoader(DictDataset(self.dict_val_12_50), batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True),
+            DataLoader(DictDataset(self.dict_val_main),  batch_size=1, collate_fn=identity, num_workers=8, pin_memory=True),
+            DataLoader(DictDataset(self.dict_val_0_781), batch_size=1, collate_fn=identity, num_workers=8, pin_memory=True),
+            DataLoader(DictDataset(self.dict_val_3_13),  batch_size=1, collate_fn=identity, num_workers=8, pin_memory=True),
+            DataLoader(DictDataset(self.dict_val_12_50), batch_size=1, collate_fn=identity, num_workers=8, pin_memory=True),
         ]
     
 
