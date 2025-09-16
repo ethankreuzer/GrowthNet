@@ -14,7 +14,21 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.strategies import DDPStrategy
+from collections import defaultdict
+import atexit
 
+import torch.distributed as dist
+
+
+from torchmetrics.functional import (
+    mean_absolute_error,
+    auroc,
+    average_precision,
+    f1_score,
+    recall,
+    pearson_corrcoef
+)
+import time
 
 if os.environ.get("RANK", "0") != "0":
     os.environ["WANDB_DISABLED"] = "true"
@@ -24,15 +38,8 @@ os.environ.setdefault("WANDB__SERVICE_WAIT", "600")
 os.environ.setdefault("WANDB_HTTP_TIMEOUT", "300")
 os.environ.setdefault("WANDB_DISABLE_CODE", "true")
 os.environ.setdefault("WANDB_SILENT", "true")
-
 import wandb
-from scipy.stats import spearmanr
-from sklearn.metrics import (
-    roc_auc_score,
-    average_precision_score,
-    recall_score,
-    f1_score,
-)
+
 
 # ─────────────────────────────────────────────────────────────
 # Import your custom datasets and collate
@@ -116,28 +123,10 @@ class MultiHeadNet(nn.Module):
         return reg_out.squeeze(-1), cls_logits.squeeze(-1)
 
 
-# ─────────────────────────────────────────────────────────────
-# METRICS
-# ─────────────────────────────────────────────────────────────
-def r2_np(y_true, y_pred):
-    y_mean = y_true.mean()
-    tss = np.sum((y_true - y_mean) ** 2)
-    sse = np.sum((y_true - y_pred) ** 2)
-    return 0.0 if np.isclose(tss, 0) else 1 - (sse / tss)
-
-def pearson_np(y_true, y_pred):
-    if np.std(y_true) == 0 or np.std(y_pred) == 0:
-        return 0.0
-    with np.errstate(divide='ignore', invalid='ignore'):
-        return float(np.corrcoef(y_true, y_pred)[0,1])
-
-def spearman_np(y_true, y_pred):
-    if np.allclose(y_true, y_true.mean()) or np.allclose(y_pred, y_pred.mean()):
-        return 0.0
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        corr, _ = spearmanr(y_true, y_pred)
-    return float(corr)
+def cleanup():
+    if dist.is_initialized():
+        dist.destroy_process_group()
+    torch.cuda.empty_cache()
 
 def batch_to_tensor(batch: dict, device: torch.device):
     if batch["t_fourier"].ndim == 3:       # (N, k, 2*num_fourier) → training
@@ -187,6 +176,12 @@ class MultiHeadLightning(pl.LightningModule):
         )
         self.mse_loss = nn.MSELoss()
         self.bce_loss = nn.BCEWithLogitsLoss()
+        
+        self.val_outputs = defaultdict(lambda: {
+            "r_pred": [], "r_true": [], "c_pred": [], "c_true": [], "n": 0
+        })
+
+
 
     def forward(self, x):
         return self.model(x)
@@ -199,54 +194,122 @@ class MultiHeadLightning(pl.LightningModule):
         loss_cls = self.bce_loss(out_cls_logits.squeeze(-1), yb_cls)
         loss = loss_cls + self.hparams.loss_lambda * loss_reg
 
-        self.log("train/reg_loss", loss_reg, on_step=True, on_epoch=False, sync_dist=False, prog_bar=False)
-        self.log("train/cls_loss", loss_cls, on_step=True, on_epoch=False, sync_dist=False, prog_bar=False)
-        self.log("train/loss",     loss,     on_step=True, on_epoch=False, sync_dist=False, prog_bar=True)
+        self.log("train/reg_loss", loss_reg, on_step=False, on_epoch=True, sync_dist=True, prog_bar=False)
+        self.log("train/cls_loss", loss_cls, on_step=False, on_epoch=True, sync_dist=True, prog_bar=False)
+        self.log("train/loss",     loss,     on_step=False, on_epoch=True, sync_dist=True, prog_bar=True)
         
         return loss
+    
+
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
+
+        if int(os.environ.get("RANK", "0")) == 0:
+            self._val_step_start = time.perf_counter()
+
         Xb, yb_reg, yb_cls = batch_to_tensor(batch, self.device)
         pred_reg, pred_cls_logits = self(Xb)
+        pred_cls_probs = torch.sigmoid(pred_cls_logits)
 
         reg_loss = self.mse_loss(pred_reg, yb_reg)
         cls_loss = self.bce_loss(pred_cls_logits.squeeze(-1), yb_cls)
         loss = reg_loss + cls_loss
 
-        dataset_names = ["val_main", "val_0_781", "val_3_13", "val_12_50"]
-        name = dataset_names[dataloader_idx]
-
         if dataloader_idx == 0:
-            # ── Only for main validation set ──
-            # Split losses by active/inactive
             active_mask = (yb_cls == 1)
             inactive_mask = ~active_mask
-
+            
             if active_mask.any():
                 reg_loss_act = self.mse_loss(pred_reg[active_mask], yb_reg[active_mask])
             else:
                 reg_loss_act = torch.tensor(0.0, device=self.device)
-
             if inactive_mask.any():
                 reg_loss_inact = self.mse_loss(pred_reg[inactive_mask], yb_reg[inactive_mask])
             else:
                 reg_loss_inact = torch.tensor(0.0, device=self.device)
 
-            # Log all main metrics
-            self.log(f"{name}/reg_loss", reg_loss, prog_bar=True, on_epoch=True, sync_dist=True)
-            self.log(f"{name}/cls_loss", cls_loss, prog_bar=True, on_epoch=True, sync_dist=True)
-            self.log(f"{name}/loss",     loss,     prog_bar=True, on_epoch=True, sync_dist=True)
-            self.log(f"{name}/reg_loss_actives",   reg_loss_act,   prog_bar=False, on_epoch=True, sync_dist=True)
-            self.log(f"{name}/reg_loss_inactives", reg_loss_inact, prog_bar=False, on_epoch=True, sync_dist=True)
-
-            # Used by early stopping callbacks etc.
-            self.log("val_loss", loss, prog_bar=True, on_epoch=True, sync_dist=True)
-
+            self.log("val_main/reg_loss", reg_loss, on_epoch=True, sync_dist=True)
+            self.log("val_main/cls_loss", cls_loss, on_epoch=True, sync_dist=True)
+            self.log("val_main/loss", loss, on_epoch=True, sync_dist=True)
+            self.log("val_main/reg_loss_actives", reg_loss_act, on_epoch=True, sync_dist=True)
+            self.log("val_main/reg_loss_inactives", reg_loss_inact, on_epoch=True, sync_dist=True)
+            self.log("val_loss", loss, on_epoch=True, sync_dist=True, prog_bar=True)
         else:
-            # ── For the 3 subset dataloaders ──
-            self.log(f"{name}/loss", loss, prog_bar=True, on_epoch=True, sync_dist=True)
+            names = ["val_0_781","val_3_13","val_12_50"]
+            self.log(f"{names[dataloader_idx-1]}/loss", loss, on_epoch=True, sync_dist=True)
+        
+        name = ["val_main","val_0_781","val_3_13","val_12_50"][dataloader_idx]
 
+        # ---- Update per (t,c) metrics ----
+        t = batch["t_raw"].detach()
+        c = batch["c_raw"].detach()
+        for ti, ci, r_pr, r_tr, c_pr, c_tr in zip(t, c, pred_reg, yb_reg, pred_cls_probs, yb_cls):
+            key = (dataloader_idx, round(ti.item(), 2), round(ci.item(), 3))
+            g = self.val_outputs[key]
+            g["r_pred"].append(r_pr.detach().cpu())
+            g["r_true"].append(r_tr.detach().cpu())
+            g["c_pred"].append(c_pr.detach().cpu())
+            g["c_true"].append(c_tr.detach().cpu())
+            g["n"] += 1
+        
+        if int(os.environ.get("RANK", "0")) == 0:
+            elapsed = time.perf_counter() - self._val_step_start
+            print(f"[RANK0] validation_step took {elapsed:.4f} seconds (loader {dataloader_idx}, batch {batch_idx})")
+
+        
         return loss
+    
+    def on_validation_epoch_end(self):
+        # Only rank 0 does metric computation/logging
+        if int(os.environ.get("RANK", "0")) != 0:
+            return
+
+        start = time.perf_counter()
+
+        by_loader = defaultdict(list)
+
+        # Group results from all (t,c) subsets
+        for (loader_idx, t, c), g in self.val_outputs.items():
+            r_pred = torch.stack(g["r_pred"])
+            r_true = torch.stack(g["r_true"])
+            c_pred = torch.stack(g["c_pred"])
+            c_true = torch.stack(g["c_true"]).int()
+
+            mae = mean_absolute_error(r_pred, r_true)
+            pearson = pearson_corrcoef(r_pred, r_true)
+            auc = auroc(c_pred, c_true, task="binary") if c_true.sum() > 0 else torch.tensor(0.0)
+            ap = average_precision(c_pred, c_true, task="binary") if c_true.sum() > 0 else torch.tensor(0.0)
+            f1 = f1_score(c_pred > 0.5, c_true, task="binary") if c_true.sum() > 0 else torch.tensor(0.0)
+            rec = recall(c_pred > 0.5, c_true, task="binary") if c_true.sum() > 0 else torch.tensor(0.0)
+            agg = ap + auc - mae + pearson
+
+            by_loader[loader_idx].append((g["n"], mae, pearson, auc, ap, f1, rec, agg))
+
+        # Clear for next epoch to free memory (do this after grouping)
+        self.val_outputs.clear()
+
+        # Compute weighted means by loader
+        names = ["val_main", "val_0_781", "val_3_13", "val_12_50"]
+        for idx, rows in by_loader.items():
+            total = sum(n for n, *_ in rows)
+
+            def wmean(i):
+                return sum(n * r[i] for n, *r in rows) / total if total > 0 else 0.0
+
+            self.log(f"{names[idx]}/mae", torch.as_tensor(wmean(0), device=self.device), sync_dist=False)
+            self.log(f"{names[idx]}/pearson", torch.as_tensor(wmean(1), device=self.device), sync_dist=False)
+            self.log(f"{names[idx]}/auc", torch.as_tensor(wmean(2), device=self.device), sync_dist=False)
+            self.log(f"{names[idx]}/ap", torch.as_tensor(wmean(3), device=self.device), sync_dist=False)
+            self.log(f"{names[idx]}/f1", torch.as_tensor(wmean(4), device=self.device), sync_dist=False)
+            self.log(f"{names[idx]}/recall", torch.as_tensor(wmean(5), device=self.device), sync_dist=False)
+            self.log(f"{names[idx]}/agg_metric", torch.as_tensor(wmean(6), device=self.device),
+                    prog_bar=True, sync_dist=False)
+
+        elapsed = time.perf_counter() - start
+        print(f"[RANK0] on_validation_epoch_end took {elapsed:.4f} seconds")
+
+
+
 
 
     def configure_optimizers(self):
@@ -303,6 +366,7 @@ class GrowthCurveDataModule(pl.LightningDataModule):
                           shuffle=False,
                           num_workers=32,
                           pin_memory=True)
+    
     def val_dataloader(self):
 
         class DictDataset(torch.utils.data.Dataset):
@@ -327,6 +391,21 @@ class GrowthCurveDataModule(pl.LightningDataModule):
 
 def is_rank_zero() -> bool:
     return int(os.environ.get("RANK", "0")) == 0
+
+'''
+def cleanup():
+    """Ensure NCCL process group + CUDA memory is released on *every rank* at exit."""
+    if dist.is_initialized():
+        try:
+            dist.destroy_process_group()
+        except Exception:
+            pass
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
+# Register cleanup for safety (will run even if ranks exit early)
+atexit.register(cleanup)
+'''
 
 def main():
     # Parse sweep-injected CLI args
@@ -388,7 +467,8 @@ def main():
     # Train
     trainer.fit(model, datamodule=dm)
 
+    #cleanup()
 
-
+    
 if __name__ == "__main__":
     main()
