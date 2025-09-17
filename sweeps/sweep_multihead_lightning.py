@@ -13,12 +13,7 @@ import json
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from pytorch_lightning.loggers import WandbLogger
-from pytorch_lightning.strategies import DDPStrategy
 from collections import defaultdict
-import atexit
-
-import torch.distributed as dist
-
 
 from torchmetrics.functional import (
     mean_absolute_error,
@@ -29,9 +24,6 @@ from torchmetrics.functional import (
     pearson_corrcoef
 )
 import time
-
-if os.environ.get("RANK", "0") != "0":
-    os.environ["WANDB_DISABLED"] = "true"
 
 # (optional but helpful on HPC)
 os.environ.setdefault("WANDB__SERVICE_WAIT", "600")
@@ -44,7 +36,7 @@ import wandb
 # ─────────────────────────────────────────────────────────────
 # Import your custom datasets and collate
 # ─────────────────────────────────────────────────────────────
-from data_class import PerCompoundDataset, ExplicitDataset, custom_collate
+from data_class import PerCompoundDataset, ExplicitDataset, custom_collate, CompoundMeta
 
 
 # --- add imports ---
@@ -53,22 +45,22 @@ import argparse
 def parse_args():
     p = argparse.ArgumentParser()
     # match the sweep yaml keys
-    p.add_argument("--samples", type=int, default=6)
-    p.add_argument("--weight_decay", type=float, default=1e-4)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--loss_lambda", type=float, default=5.0)
-    p.add_argument("--min_lr", type=float, default=1e-7)
-    p.add_argument("--learning_rate", type=float, default=1e-3)
-    p.add_argument("--dropout_rate", type=float, default=0.2)
-    p.add_argument("--active_fraction", type=float, default=0.6)
-    p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--epochs", type=int, default=25)
-    p.add_argument("--trunk_layers", type=int, default=5)
-    p.add_argument("--trunk_dim", type=int, default=64)
-    p.add_argument("--reg_layers", type=int, default=1)
-    p.add_argument("--reg_hidden", type=int, default=16)
-    p.add_argument("--cls_layers", type=int, default=1)
-    p.add_argument("--cls_hidden", type=int, default=16)
+    p.add_argument("--samples", type=int)
+    p.add_argument("--weight_decay", type=float,)
+    p.add_argument("--seed", type=int)
+    p.add_argument("--loss_lambda", type=float)
+    p.add_argument("--min_lr", type=float)
+    p.add_argument("--learning_rate", type=float)
+    p.add_argument("--dropout_rate", type=float)
+    p.add_argument("--active_fraction", type=float)
+    p.add_argument("--batch_size", type=int)
+    p.add_argument("--epochs", type=int)
+    p.add_argument("--trunk_layers", type=int)
+    p.add_argument("--trunk_dim", type=int)
+    p.add_argument("--reg_layers", type=int)
+    p.add_argument("--reg_hidden", type=int)
+    p.add_argument("--cls_layers", type=int)
+    p.add_argument("--cls_hidden", type=int)
     return vars(p.parse_args())
 
 
@@ -123,10 +115,6 @@ class MultiHeadNet(nn.Module):
         return reg_out.squeeze(-1), cls_logits.squeeze(-1)
 
 
-def cleanup():
-    if dist.is_initialized():
-        dist.destroy_process_group()
-    torch.cuda.empty_cache()
 
 def batch_to_tensor(batch: dict, device: torch.device):
     if batch["t_fourier"].ndim == 3:       # (N, k, 2*num_fourier) → training
@@ -194,9 +182,9 @@ class MultiHeadLightning(pl.LightningModule):
         loss_cls = self.bce_loss(out_cls_logits.squeeze(-1), yb_cls)
         loss = loss_cls + self.hparams.loss_lambda * loss_reg
 
-        self.log("train/reg_loss", loss_reg, on_step=False, on_epoch=True, sync_dist=True, prog_bar=False)
-        self.log("train/cls_loss", loss_cls, on_step=False, on_epoch=True, sync_dist=True, prog_bar=False)
-        self.log("train/loss",     loss,     on_step=False, on_epoch=True, sync_dist=True, prog_bar=True)
+        self.log("train/reg_loss", loss_reg, on_step=False, on_epoch=True, sync_dist=False, prog_bar=False)
+        self.log("train/cls_loss", loss_cls, on_step=False, on_epoch=True, sync_dist=False, prog_bar=False)
+        self.log("train/loss",     loss,     on_step=False, on_epoch=True, sync_dist=False, prog_bar=True)
         
         return loss
     
@@ -204,8 +192,8 @@ class MultiHeadLightning(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
 
-        if int(os.environ.get("RANK", "0")) == 0:
-            self._val_step_start = time.perf_counter()
+        
+        self._val_step_start = time.perf_counter()
 
         Xb, yb_reg, yb_cls = batch_to_tensor(batch, self.device)
         pred_reg, pred_cls_logits = self(Xb)
@@ -228,15 +216,15 @@ class MultiHeadLightning(pl.LightningModule):
             else:
                 reg_loss_inact = torch.tensor(0.0, device=self.device)
 
-            self.log("val_main/reg_loss", reg_loss, on_epoch=True, sync_dist=True)
-            self.log("val_main/cls_loss", cls_loss, on_epoch=True, sync_dist=True)
-            self.log("val_main/loss", loss, on_epoch=True, sync_dist=True)
-            self.log("val_main/reg_loss_actives", reg_loss_act, on_epoch=True, sync_dist=True)
-            self.log("val_main/reg_loss_inactives", reg_loss_inact, on_epoch=True, sync_dist=True)
-            self.log("val_loss", loss, on_epoch=True, sync_dist=True, prog_bar=True)
+            self.log("val_main/reg_loss", reg_loss, on_epoch=True, sync_dist=False)
+            self.log("val_main/cls_loss", cls_loss, on_epoch=True, sync_dist=False)
+            self.log("val_main/loss", loss, on_epoch=True, sync_dist=False)
+            self.log("val_main/reg_loss_actives", reg_loss_act, on_epoch=True, sync_dist=False)
+            self.log("val_main/reg_loss_inactives", reg_loss_inact, on_epoch=True, sync_dist=False)
+            self.log("val_loss", loss, on_epoch=True, prog_bar=True, sync_dist=False)
         else:
             names = ["val_0_781","val_3_13","val_12_50"]
-            self.log(f"{names[dataloader_idx-1]}/loss", loss, on_epoch=True, sync_dist=True)
+            self.log(f"{names[dataloader_idx-1]}/loss", loss, on_epoch=True, sync_dist=False)
         
         name = ["val_main","val_0_781","val_3_13","val_12_50"][dataloader_idx]
 
@@ -252,17 +240,15 @@ class MultiHeadLightning(pl.LightningModule):
             g["c_true"].append(c_tr.detach().cpu())
             g["n"] += 1
         
-        if int(os.environ.get("RANK", "0")) == 0:
-            elapsed = time.perf_counter() - self._val_step_start
-            print(f"[RANK0] validation_step took {elapsed:.4f} seconds (loader {dataloader_idx}, batch {batch_idx})")
+        
+        elapsed = time.perf_counter() - self._val_step_start
+        print(f"validation_step took {elapsed:.4f} seconds (loader {dataloader_idx}, batch {batch_idx})")
 
         
         return loss
     
     def on_validation_epoch_end(self):
-        # Only rank 0 does metric computation/logging
-        if int(os.environ.get("RANK", "0")) != 0:
-            return
+        
 
         start = time.perf_counter()
 
@@ -306,9 +292,7 @@ class MultiHeadLightning(pl.LightningModule):
                     prog_bar=True, sync_dist=False)
 
         elapsed = time.perf_counter() - start
-        print(f"[RANK0] on_validation_epoch_end took {elapsed:.4f} seconds")
-
-
+        print(f"on_validation_epoch_end took {elapsed:.4f} seconds")
 
 
 
@@ -346,9 +330,9 @@ class GrowthCurveDataModule(pl.LightningDataModule):
 
     def train_dataloader(self):
 
-        rank = int(os.environ.get("RANK", "0"))
+        
         g = torch.Generator()
-        g.manual_seed(self.config['seed'] + rank)
+        g.manual_seed(self.config['seed'])
 
         num_actives = sum(meta.is_active_at_12_50 for meta in self.train_ds._metas)
         num_inactives = len(self.train_ds) - num_actives
@@ -389,24 +373,6 @@ class GrowthCurveDataModule(pl.LightningDataModule):
 # MAIN
 # ─────────────────────────────────────────────────────────────
 
-def is_rank_zero() -> bool:
-    return int(os.environ.get("RANK", "0")) == 0
-
-'''
-def cleanup():
-    """Ensure NCCL process group + CUDA memory is released on *every rank* at exit."""
-    if dist.is_initialized():
-        try:
-            dist.destroy_process_group()
-        except Exception:
-            pass
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-
-# Register cleanup for safety (will run even if ranks exit early)
-atexit.register(cleanup)
-'''
-
 def main():
     # Parse sweep-injected CLI args
     config = parse_args()
@@ -444,7 +410,7 @@ def main():
     model = MultiHeadLightning(input_dim=Xte.shape[1], config=config)
 
     # Logger only on rank 0 (rank guard should be defined elsewhere)
-    wandb_logger = WandbLogger() if is_rank_zero() else None
+    wandb_logger = WandbLogger()
     if wandb_logger is not None:
         # record sweep config on the run
         try:
@@ -456,18 +422,16 @@ def main():
     trainer = pl.Trainer(
         max_epochs=config['epochs'],
         accelerator="gpu",
-        devices=min(3, torch.cuda.device_count()),
-        strategy=DDPStrategy(find_unused_parameters=False),
+        devices=1,
         logger=wandb_logger,
         log_every_n_steps=10,
-        enable_progress_bar=is_rank_zero(),
+        enable_progress_bar=True,
         num_sanity_val_steps=0,
     )
 
     # Train
     trainer.fit(model, datamodule=dm)
 
-    #cleanup()
 
     
 if __name__ == "__main__":

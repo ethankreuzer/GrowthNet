@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import Dataset
 from scipy.interpolate import RectBivariateSpline
 from torch.utils.data._utils.collate import default_collate
-
+import pickle
 
 @dataclass(frozen=True)
 class CompoundMeta:
@@ -83,50 +83,13 @@ class PerCompoundDataset(Dataset):
             
         # Build per-compound metadata
         self._metas: List[CompoundMeta] = []
-        for comp, sub in self.df.groupby('Compound', sort=True): #MAY need to change this to group by SMILES, assuming fp map is injective
-            
-            sub = sub.sort_values(['Timepoint', 'Concentration'])
-
-            piv_od = sub.pivot(index='Timepoint', columns='Concentration', values='OD') \
-                        .sort_index(axis=0).sort_index(axis=1)
-            piv_cls = sub.pivot(index='Timepoint', columns='Concentration', values='is_Active') \
-                        .sort_index(axis=0).sort_index(axis=1)
-
-            t_vals = piv_od.index.values.astype(float)
-            c_vals = piv_od.columns.values.astype(float)
-            smiles = str(sub['Smiles'].iloc[0])
-
-            # Per-family fingerprint vectors, consistent length/order across compounds
-            fps_by_family: Dict[str, np.ndarray] = {}
-            
-            for col in self.fp_cols_by_family: #extract fp for associated family (maccs, rdkit, ecfp...)
-  
-                arr = sub[col].iloc[0]              
-                vec = np.array(arr, dtype=np.float32)
-                fps_by_family[col] = vec
 
 
-            single_conc = (c_vals.size == 1)
-            meta = CompoundMeta(
-                compound=comp,
-                smiles=smiles,
-                pivot_od=piv_od,
-                pivot_cls=piv_cls,
-                t_vals=t_vals,
-                c_vals=c_vals,
-                single_conc=single_conc,
-                t_min=float(t_vals.min()),
-                t_max=float(t_vals.max()),
-                logc_min=float(np.log(c_vals.min())),
-                logc_max=float(np.log(c_vals.max())),
-                fps_by_family=fps_by_family,
-                is_active_at_12_50=bool(
-                    (12.48 in piv_cls.index) and 
-                    (50.0 in piv_cls.columns) and 
-                    (piv_cls.at[12.48, 50.0] == 1)
-                )
-            )
-            self._metas.append(meta)
+        with open("/home/ethan2/GrowthCurve/data/train/CompoundMetas_list.pkl", "rb") as f:
+            saved_metas=pickle.load(f)
+
+
+        self._metas=saved_metas
 
         if not self._metas:
             raise ValueError("No compounds available after filtering.")
@@ -337,17 +300,23 @@ class PerCompoundDataset(Dataset):
         # --- Classification (distance-weighted k-NN) ---
         pred_label, p_active = -1, np.nan
         if labels_pivot is not None:
+
+            grid_cls = labels_pivot.loc[times_used, concs_used] #4 nearest neighbors are in the 9 used for interpolation
             # Collect all valid datapoints
             coords_time, coords_conc = np.meshgrid(
-                labels_pivot.index.values.astype(float),
-                labels_pivot.columns.values.astype(float),
+                grid_cls.index.values.astype(float),
+                grid_cls.columns.values.astype(float),
                 indexing="ij"
             )
             coords_time = coords_time.ravel()
             coords_conc = coords_conc.ravel()
             coords_logc = np.log(coords_conc)
-            coords_od = od_pivot.to_numpy().ravel()
-            coords_labels = labels_pivot.to_numpy().ravel()
+
+
+            grid_od = od_pivot.loc[times_used, concs_used]
+            grid_labels = labels_pivot.loc[times_used, concs_used]
+            coords_od = grid_od.to_numpy().ravel()
+            coords_labels = grid_labels.to_numpy().ravel()
 
             mask = ~np.isnan(coords_od) & ~np.isnan(coords_labels)
             coords_time, coords_logc, coords_od, coords_labels = (
