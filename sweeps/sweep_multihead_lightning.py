@@ -273,7 +273,7 @@ class MultiHeadLightning(pl.LightningModule):
         return loss
     
     def on_validation_epoch_end(self):
-        start = time.perf_counter()
+        
 
         by_loader = defaultdict(list)
 
@@ -284,8 +284,16 @@ class MultiHeadLightning(pl.LightningModule):
             c_pred = torch.stack(g["c_pred"])
             c_true = torch.stack(g["c_true"]).int()
 
-            mae = mean_absolute_error(r_pred, r_true)
-            pearson = pearson_corrcoef(r_pred, r_true)
+            # --- Actives mask for regression metrics ---
+            active_mask = c_true == 1
+            if active_mask.any():
+                mae = mean_absolute_error(r_pred[active_mask], r_true[active_mask])
+                pearson = pearson_corrcoef(r_pred[active_mask], r_true[active_mask])
+            else:
+                mae = torch.tensor(0.0, device=r_pred.device)
+                pearson = torch.tensor(0.0, device=r_pred.device)
+
+            
             auc = auroc(c_pred, c_true, task="binary") if c_true.sum() > 0 else torch.tensor(0.0)
             ap = average_precision(c_pred, c_true, task="binary") if c_true.sum() > 0 else torch.tensor(0.0)
             f1 = f1_score(c_pred > 0.5, c_true, task="binary") if c_true.sum() > 0 else torch.tensor(0.0)
@@ -316,8 +324,8 @@ class MultiHeadLightning(pl.LightningModule):
             agg = ap_w + auc_w - mae_w + pear_w
 
             # Log everything
-            self.log(f"{names[idx]}/mae", mae_w, sync_dist=False)
-            self.log(f"{names[idx]}/pearson", pear_w, sync_dist=False)
+            self.log(f"{names[idx]}/mae_active", mae_w, sync_dist=False)
+            self.log(f"{names[idx]}/pearson_active", pear_w, sync_dist=False)
             self.log(f"{names[idx]}/auc", auc_w, sync_dist=False)
             self.log(f"{names[idx]}/ap", ap_w, sync_dist=False)
             self.log(f"{names[idx]}/f1", f1_w, sync_dist=False)
@@ -332,9 +340,8 @@ class MultiHeadLightning(pl.LightningModule):
                 self.log("val_main/best_agg_metric", self.best_val_main_agg,
                         prog_bar=True, sync_dist=False)
 
-        elapsed = time.perf_counter() - start
-        print(f"on_validation_epoch_end took {elapsed:.4f} seconds")
-
+        
+        
 
 
 
@@ -398,7 +405,7 @@ class GrowthCurveDataModule(pl.LightningDataModule):
                           sampler=sampler,
                           collate_fn=custom_collate,
                           shuffle=False,
-                          num_workers=10,
+                          num_workers=6,
                           pin_memory=True)
     
     def val_dataloader(self):
@@ -411,10 +418,10 @@ class GrowthCurveDataModule(pl.LightningDataModule):
         identity = lambda batch: batch[0]  # don’t stack into a batch
 
         return [
-            DataLoader(DictDataset(self.dict_val_main),  batch_size=1, collate_fn=identity, num_workers=8, pin_memory=True),
-            DataLoader(DictDataset(self.dict_val_0_781), batch_size=1, collate_fn=identity, num_workers=8, pin_memory=True),
-            DataLoader(DictDataset(self.dict_val_3_13),  batch_size=1, collate_fn=identity, num_workers=8, pin_memory=True),
-            DataLoader(DictDataset(self.dict_val_12_50), batch_size=1, collate_fn=identity, num_workers=8, pin_memory=True),
+            DataLoader(DictDataset(self.dict_val_main),  batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True),
+            DataLoader(DictDataset(self.dict_val_0_781), batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True),
+            DataLoader(DictDataset(self.dict_val_3_13),  batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True),
+            DataLoader(DictDataset(self.dict_val_12_50), batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True),
         ]
     
 
