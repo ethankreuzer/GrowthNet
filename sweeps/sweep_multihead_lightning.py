@@ -10,10 +10,12 @@ import torch.nn as nn
 import pytorch_lightning as pl
 import torch.distributed as dist
 import json
+
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from pytorch_lightning.loggers import WandbLogger
 from collections import defaultdict
+from pytorch_lightning.callbacks import ModelCheckpoint
 
 from torchmetrics.functional import (
     mean_absolute_error,
@@ -49,19 +51,21 @@ def parse_args():
     p.add_argument("--weight_decay", type=float,)
     p.add_argument("--seed", type=int)
     p.add_argument("--loss_lambda", type=float)
-    p.add_argument("--min_lr", type=float)
-    p.add_argument("--learning_rate", type=float)
+    p.add_argument("--max_learning_rate", type=float)
     p.add_argument("--dropout_rate", type=float)
     p.add_argument("--active_fraction", type=float)
     p.add_argument("--batch_size", type=int)
     p.add_argument("--epochs", type=int)
     p.add_argument("--trunk_layers", type=int)
     p.add_argument("--trunk_dim", type=int)
+    p.add_argument("--trunk_final_layer_dim", type=int)
     p.add_argument("--reg_layers", type=int)
     p.add_argument("--reg_hidden", type=int)
     p.add_argument("--cls_layers", type=int)
     p.add_argument("--cls_hidden", type=int)
+    
     return vars(p.parse_args())
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -72,6 +76,7 @@ class MultiHeadNet(nn.Module):
                  input_dim: int,
                  trunk_layers: int,
                  trunk_dim: int,
+                 last_trunk_dim: int,
                  reg_layers: int,
                  reg_hidden: int,
                  cls_layers: int,
@@ -81,29 +86,47 @@ class MultiHeadNet(nn.Module):
         # Shared trunk
         trunk = []
         prev_dim = input_dim
-        for _ in range(trunk_layers):
+        for _ in range(trunk_layers-1):
             trunk += [
                 nn.Linear(prev_dim, trunk_dim),
+                nn.LayerNorm(trunk_dim),
                 nn.ReLU(inplace=True),
                 nn.Dropout(dropout_rate),
             ]
             prev_dim = trunk_dim
+        
+        trunk+=[nn.Linear(trunk_dim, last_trunk_dim),
+                nn.LayerNorm(last_trunk_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout_rate)
+                ]
+
         self.trunk = nn.Sequential(*trunk)
 
         # Regression head
         reg = []
-        prev = trunk_dim
+        prev = last_trunk_dim
         for _ in range(reg_layers):
-            reg += [nn.Linear(prev, reg_hidden), nn.ReLU(inplace=True)]
+            reg += [
+                    nn.Linear(prev, reg_hidden),
+                    nn.LayerNorm(reg_hidden),
+                    nn.ReLU(inplace=True)
+            ]
+            
             prev = reg_hidden
         reg += [nn.Linear(prev, 1)]
         self.reg_head = nn.Sequential(*reg)
 
         # Classification head
         cls = []
-        prev = trunk_dim
+        prev = last_trunk_dim
         for _ in range(cls_layers):
-            cls += [nn.Linear(prev, cls_hidden), nn.ReLU(inplace=True)]
+            cls += [
+                nn.Linear(prev, cls_hidden),
+                nn.LayerNorm(cls_hidden),
+                nn.ReLU(inplace=True)
+            ]
+            
             prev = cls_hidden
         cls += [nn.Linear(prev, 1)]
         self.cls_head = nn.Sequential(*cls)
@@ -161,6 +184,7 @@ class MultiHeadLightning(pl.LightningModule):
             cls_layers   = config['cls_layers'],
             cls_hidden   = config['cls_hidden'],
             dropout_rate = config['dropout_rate'],
+            last_trunk_dim=config['trunk_final_layer_dim']
         )
         self.mse_loss = nn.MSELoss()
         self.bce_loss = nn.BCEWithLogitsLoss()
@@ -168,6 +192,7 @@ class MultiHeadLightning(pl.LightningModule):
         self.val_outputs = defaultdict(lambda: {
             "r_pred": [], "r_true": [], "c_pred": [], "c_true": [], "n": 0
         })
+        self.best_val_main_agg = float("-inf")
 
 
 
@@ -248,8 +273,6 @@ class MultiHeadLightning(pl.LightningModule):
         return loss
     
     def on_validation_epoch_end(self):
-        
-
         start = time.perf_counter()
 
         by_loader = defaultdict(list)
@@ -267,11 +290,11 @@ class MultiHeadLightning(pl.LightningModule):
             ap = average_precision(c_pred, c_true, task="binary") if c_true.sum() > 0 else torch.tensor(0.0)
             f1 = f1_score(c_pred > 0.5, c_true, task="binary") if c_true.sum() > 0 else torch.tensor(0.0)
             rec = recall(c_pred > 0.5, c_true, task="binary") if c_true.sum() > 0 else torch.tensor(0.0)
-            agg = ap + auc - mae + pearson
 
-            by_loader[loader_idx].append((g["n"], mae, pearson, auc, ap, f1, rec, agg))
+            # store per-subgroup results
+            by_loader[loader_idx].append((g["n"], mae, pearson, auc, ap, f1, rec))
 
-        # Clear for next epoch to free memory (do this after grouping)
+        # Clear for next epoch
         self.val_outputs.clear()
 
         # Compute weighted means by loader
@@ -282,30 +305,49 @@ class MultiHeadLightning(pl.LightningModule):
             def wmean(i):
                 return sum(n * r[i] for n, *r in rows) / total if total > 0 else 0.0
 
-            self.log(f"{names[idx]}/mae", torch.as_tensor(wmean(0), device=self.device), sync_dist=False)
-            self.log(f"{names[idx]}/pearson", torch.as_tensor(wmean(1), device=self.device), sync_dist=False)
-            self.log(f"{names[idx]}/auc", torch.as_tensor(wmean(2), device=self.device), sync_dist=False)
-            self.log(f"{names[idx]}/ap", torch.as_tensor(wmean(3), device=self.device), sync_dist=False)
-            self.log(f"{names[idx]}/f1", torch.as_tensor(wmean(4), device=self.device), sync_dist=False)
-            self.log(f"{names[idx]}/recall", torch.as_tensor(wmean(5), device=self.device), sync_dist=False)
-            self.log(f"{names[idx]}/agg_metric", torch.as_tensor(wmean(6), device=self.device),
+            mae_w  = wmean(0)
+            pear_w = wmean(1)
+            auc_w  = wmean(2)
+            ap_w   = wmean(3)
+            f1_w   = wmean(4)
+            rec_w  = wmean(5)
+
+            
+            agg = ap_w + auc_w - mae_w + pear_w
+
+            # Log everything
+            self.log(f"{names[idx]}/mae", mae_w, sync_dist=False)
+            self.log(f"{names[idx]}/pearson", pear_w, sync_dist=False)
+            self.log(f"{names[idx]}/auc", auc_w, sync_dist=False)
+            self.log(f"{names[idx]}/ap", ap_w, sync_dist=False)
+            self.log(f"{names[idx]}/f1", f1_w, sync_dist=False)
+            self.log(f"{names[idx]}/recall", rec_w, sync_dist=False)
+            self.log(f"{names[idx]}/AP+AUC-MAE+Pearson", agg,
                     prog_bar=True, sync_dist=False)
+
+            # Track best agg on val_main
+            if idx == 0:
+                if agg > getattr(self, "best_val_main_agg", float("-inf")):
+                    self.best_val_main_agg = agg
+                self.log("val_main/best_agg_metric", self.best_val_main_agg,
+                        prog_bar=True, sync_dist=False)
 
         elapsed = time.perf_counter() - start
         print(f"on_validation_epoch_end took {elapsed:.4f} seconds")
 
 
 
+
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(
             self.parameters(),
-            lr=self.hparams.learning_rate,
+            lr=self.hparams.max_learning_rate,
             weight_decay=self.hparams.weight_decay
         )
         scheduler = CosineAnnealingLR(
             optimizer,
             T_max=self.hparams.epochs,
-            eta_min=self.hparams.min_lr,
+            eta_min=1e-8,
         )
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
@@ -324,15 +366,23 @@ class GrowthCurveDataModule(pl.LightningDataModule):
         self.dict_val_12_50 = dict_val_12_50
 
     def setup(self, stage=None):
-        self.train_ds = PerCompoundDataset(
-            self.df_train, k=self.config['samples'], seed=None, num_fourier=3
-        )
+        #self.train_ds = PerCompoundDataset(
+        #    self.df_train, k=self.config['samples'], seed=None, num_fourier=3
+        #)
+        pass
 
     def train_dataloader(self):
 
+        epoch = getattr(self.trainer, "current_epoch", 0)
+
+        self.train_ds = PerCompoundDataset(
+           self.df_train, k=self.config['samples'], seed=self.config['seed']+ epoch, num_fourier=3
+        )
+
+        
         
         g = torch.Generator()
-        g.manual_seed(self.config['seed'])
+        g.manual_seed(self.config['seed'] + epoch)
 
         num_actives = sum(meta.is_active_at_12_50 for meta in self.train_ds._metas)
         num_inactives = len(self.train_ds) - num_actives
@@ -348,7 +398,7 @@ class GrowthCurveDataModule(pl.LightningDataModule):
                           sampler=sampler,
                           collate_fn=custom_collate,
                           shuffle=False,
-                          num_workers=32,
+                          num_workers=10,
                           pin_memory=True)
     
     def val_dataloader(self):
@@ -417,8 +467,22 @@ def main():
             wandb_logger.experiment.config.update(config, allow_val_change=True)
         except Exception:
             pass
+    
+    run_id = wandb.run.id if wandb.run else "debug"
 
-    # Trainer (DDP over up to 3 GPUs)
+    save_dir = f'/home/ethan2/GrowthCurve/models/final_sweep/checkpoints/{run_id}'
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    checkpoint_cb = ModelCheckpoint(
+        dirpath=save_dir,
+        filename="best_params",
+        monitor="val_main/AP+AUC-MAE+Pearson",   # metric you log
+        mode="max",                              # maximize agg metric
+        save_top_k=1,                            # only keep the best
+        save_last=False,                          # also save the last epoch
+    )
+
     trainer = pl.Trainer(
         max_epochs=config['epochs'],
         accelerator="gpu",
@@ -427,10 +491,31 @@ def main():
         log_every_n_steps=10,
         enable_progress_bar=True,
         num_sanity_val_steps=0,
+        callbacks=[checkpoint_cb]
     )
 
     # Train
     trainer.fit(model, datamodule=dm)
+
+    # ── Save hparams.json alongside best.ckpt ──
+    import json
+    with open(os.path.join(save_dir, "hparams.json"), "w") as f:
+        json.dump(config, f, indent=2)
+
+    # Log local path of best checkpoint to wandb (for traceability)
+    best_ckpt = checkpoint_cb.best_model_path
+    if best_ckpt:
+        wandb.log({"best_checkpoint_path": best_ckpt})
+        print(f"Best checkpoint saved at: {best_ckpt}")
+        print(f"Hparams saved at: {os.path.join(save_dir, 'hparams.json')}")
+
+
+
+
+    best_ckpt = checkpoint_cb.best_model_path
+    if best_ckpt:
+        wandb.log({"best_checkpoint_path": best_ckpt})
+        print(f"Best checkpoint saved at: {best_ckpt}")
 
 
     
