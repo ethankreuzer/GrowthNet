@@ -312,15 +312,14 @@ def train():
     best_metric   = -float("inf")          
     best_state    = None
 
-    if accelerator.is_main_process:
-        outdir = f"/home/ethan2/GrowthCurve/experiments/Multihead/{sweep_id}"
-        os.makedirs(outdir, exist_ok=True)                   
-        best_ckpt = os.path.join(outdir,f"multihead_{run_id}_best.pt")
+    #if accelerator.is_main_process:
+    #    outdir = f"/home/ethan2/GrowthCurve/experiments/Multihead/{sweep_id}"
+    #    os.makedirs(outdir, exist_ok=True)                   
+    #    best_ckpt = os.path.join(outdir,f"multihead_{run_id}_best.pt")
 
 
     # ─── Training Loop ─────────────────────────────────────────────────────
     for epoch in range(1, config.epochs + 1):
-       
         
         train_ds = PerCompoundDataset(df_train, k=config.samples, seed=None, num_fourier=3)
         num_actives = sum(meta.is_active_at_12_50 for meta in train_ds._metas)
@@ -407,10 +406,10 @@ def train():
             val_loss_act = val_reg_loss_act + val_cls_loss_act
 
             # ─── 1) Entire TRAIN set ─────────────────────────────────────────
-            r2_train      = compute_weighted_metric(model, df_train, cols_rem, r2_np,      head="reg")
-            pearson_train = compute_weighted_metric(model, df_train, cols_rem, pearson_np, head="reg")
-            spearman_train= compute_weighted_metric(model, df_train, cols_rem, spearman_np,head="reg")
-
+            #r2_train      = compute_weighted_metric(model, df_train, cols_rem, r2_np,      head="reg")
+            #pearson_train = compute_weighted_metric(model, df_train, cols_rem, pearson_np, head="reg")
+            #spearman_train= compute_weighted_metric(model, df_train, cols_rem, spearman_np,head="reg")
+            '''
             ap_train     = compute_weighted_metric(
                 model, df_train, cols_rem, average_precision_score,
                 target_col="is_Active", head="cls"
@@ -449,7 +448,7 @@ def train():
                 model, df_test, cols_rem, lambda y,p: recall_score(y, p>0.5),
                 target_col="is_Active", head="cls"
             )
-
+            
             # ─── 3) Active‐only VAL set ─────────────────────────────────────────
             df_test_act = df_test[df_test["is_Active"] == 1]
 
@@ -480,7 +479,7 @@ def train():
             mae_val_12_50 = compute_weighted_metric(model, df_test_conc_12_50, cols_rem, mean_absolute_error, head="reg")
             r2_val_12_50     = compute_weighted_metric(model, df_test_conc_12_50, cols_rem, r2_np,      head="reg")
             pearson_val_12_50 = compute_weighted_metric(model, df_test_conc_12_50, cols_rem, pearson_np, head="reg")
-
+            
 
             #Goal Metric
 
@@ -496,7 +495,7 @@ def train():
                 if accelerator.is_main_process:
                     torch.save(best_state, best_ckpt)
 
-
+            '''
         # ─── Single W&B log with everything ─────────────────────────────────────
         
         if accelerator.is_main_process: 
@@ -505,13 +504,13 @@ def train():
                 #MODEL ARCHITECTURE
                 "seed": config.seed,
                 "time_encoding": "fourier",
-                "conc_encoding": config.encoding,
+                "conc_encoding": "raw+log",
                 "epochs": config.epochs,
                 "loss_lambda": config.loss_lambda,
                 "min_lr": config.min_lr,
                 "model": "MultiHeadNet",
                 "batch_size": config.batch_size,
-                "input_dim": Xtr.shape[1],
+                "input_dim": Xte.shape[1],
                 "trunk_layers": config.trunk_layers,
                 "trunk_dim": config.trunk_dim,
                 "reg_layers": config.reg_layers,
@@ -535,49 +534,49 @@ def train():
                 "val_cls_loss_act": val_cls_loss_act,
                 "val_loss_act": val_loss_act,
                 
-                "train_r2":       r2_train,
-                "train_pearson":  pearson_train,
-                "train_ap":       ap_train,
-                "train_f1":       f1_train,
-                "train_auc":      auc_train,
-                "train_recall":   recall_train,
+                #"train_r2":       r2_train,
+                #"train_pearson":  pearson_train,
+                #"train_ap":       ap_train,
+                #"train_f1":       f1_train,
+                #"train_auc":      auc_train,
+                #"train_recall":   recall_train,
 
                 ### VALIDATION SET
-                "val_r2":         r2_val,
-                "val_pearson":    pearson_val,
-                "val_ap":         ap_val,
-                "val_f1":         f1_val,
-                "val_auc":        auc_val,
-                "val_recall":     recall_val,
+                #"val_r2":         r2_val,
+                #"val_pearson":    pearson_val,
+                #"val_ap":         ap_val,
+                #"val_f1":         f1_val,
+                #"val_auc":        auc_val,
+                #"val_recall":     recall_val,
 
                 ### ACTIVE‐ONLY VALIDATION
-                "val_r2_act":       r2_val_act,
-                "mae_val_act": mae_val_act,
-                "val_pearson_act":  pearson_val_act,
+                #"val_r2_act":       r2_val_act,
+                #"mae_val_act": mae_val_act,
+                #"val_pearson_act":  pearson_val_act,
 
                 ###INACTIVE Validation
-                "val_r2_inact":       r2_val_inact,
-                "val_pearson_inact":  pearson_val_inact,
-                "mae_val_inact": mae_val_inact,
+                #"val_r2_inact":       r2_val_inact,
+                #"val_pearson_inact":  pearson_val_inact,
+                #"mae_val_inact": mae_val_inact,
 
 
                 ### 0.781 Conc validation metrics
-                "mae_val_0_781": mae_val_0_781,
-                "r2_val_0_781": r2_val_0_781,
-                "pearson_val_0_781":pearson_val_0_781,
+                #"mae_val_0_781": mae_val_0_781,
+                #"r2_val_0_781": r2_val_0_781,
+                #"pearson_val_0_781":pearson_val_0_781,
 
                 ### 3.13 Conc validation metrics
-                "mae_val_3_13": mae_val_3_13,
-                "r2_val_3_13": r2_val_3_13,
-                "pearson_val_3_13":pearson_val_3_13,
+                #"mae_val_3_13": mae_val_3_13,
+                #"r2_val_3_13": r2_val_3_13,
+                #"pearson_val_3_13":pearson_val_3_13,
 
                 ### 12.50 Conc validation metrics
-                "mae_val_12_50": mae_val_12_50,
-                "r2_val_12_50": r2_val_12_50,
-                "pearson_val_12_50":pearson_val_12_50,
+                #"mae_val_12_50": mae_val_12_50,
+                #"r2_val_12_50": r2_val_12_50,
+                #"pearson_val_12_50":pearson_val_12_50,
 
                 ###Metric to optimize
-                "AP+AUC+Pearson-MAE": AP_AUC_Pearson_MAE,
+                #"AP+AUC+Pearson-MAE": AP_AUC_Pearson_MAE,
 
             })
 
@@ -586,18 +585,18 @@ def train():
 
 
     # ─── Restore best & Save ──────────────────────────────────────────────
-    accelerator.unwrap_model(model).load_state_dict(best_state)
+    #accelerator.unwrap_model(model).load_state_dict(best_state)
 
 
-    if accelerator.is_main_process:
-        art = wandb.Artifact(
-            name=f"multihead_{run_id}_best_model",
-            type="model",
-            description="Dual‐head MLP: regression + classification"
-        )
-        art.add_file(best_ckpt)
-        art.metadata = dict(wandb.config)
-        wandb.log_artifact(art)
+    #if accelerator.is_main_process:
+    #    art = wandb.Artifact(
+    #        name=f"multihead_{run_id}_best_model",
+    #        type="model",
+    #        description="Dual‐head MLP: regression + classification"
+    #    )
+    #    art.add_file(best_ckpt)
+    #    art.metadata = dict(wandb.config)
+    #    wandb.log_artifact(art)
 
     if accelerator.is_main_process:
         wandb.finish()

@@ -10,7 +10,8 @@ import torch.nn as nn
 import pytorch_lightning as pl
 import torch.distributed as dist
 import json
-
+import matplotlib.pyplot as plt
+import pandas as pd
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from pytorch_lightning.loggers import WandbLogger
@@ -63,14 +64,14 @@ def parse_args():
     p.add_argument("--reg_hidden", type=int)
     p.add_argument("--cls_layers", type=int)
     p.add_argument("--cls_hidden", type=int)
+    p.add_argument("--regression_noise", type=float)
     
     return vars(p.parse_args())
-
-
 
 # ─────────────────────────────────────────────────────────────
 # MODEL
 # ─────────────────────────────────────────────────────────────
+
 class MultiHeadNet(nn.Module):
     def __init__(self,
                  input_dim: int,
@@ -83,41 +84,55 @@ class MultiHeadNet(nn.Module):
                  cls_hidden: int,
                  dropout_rate: float):
         super().__init__()
-        # Shared trunk
+
+        # ── Shared trunk ────────────────────────────────────────────────
         trunk = []
         prev_dim = input_dim
-        for _ in range(trunk_layers-1):
+
+        if trunk_layers > 1: 
+            
+            for _ in range(trunk_layers - 1):
+                trunk += [
+                    nn.Linear(prev_dim, trunk_dim),
+                    nn.LayerNorm(trunk_dim),
+                    nn.ReLU(inplace=True),
+                    nn.Dropout(dropout_rate),
+                ]
+                prev_dim = trunk_dim
+            
+            
+            trunk += [
+                nn.Linear(trunk_dim, last_trunk_dim),
+                nn.LayerNorm(last_trunk_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout_rate)
+            ]
+        else:
+            
             trunk += [
                 nn.Linear(prev_dim, trunk_dim),
                 nn.LayerNorm(trunk_dim),
                 nn.ReLU(inplace=True),
                 nn.Dropout(dropout_rate),
             ]
-            prev_dim = trunk_dim
-        
-        trunk+=[nn.Linear(trunk_dim, last_trunk_dim),
-                nn.LayerNorm(last_trunk_dim),
-                nn.ReLU(inplace=True),
-                nn.Dropout(dropout_rate)
-                ]
+            last_trunk_dim = trunk_dim  # ← Masking fix
 
         self.trunk = nn.Sequential(*trunk)
 
-        # Regression head
+        # ── Regression head ─────────────────────────────────────────────
         reg = []
         prev = last_trunk_dim
         for _ in range(reg_layers):
             reg += [
-                    nn.Linear(prev, reg_hidden),
-                    nn.LayerNorm(reg_hidden),
-                    nn.ReLU(inplace=True)
+                nn.Linear(prev, reg_hidden),
+                nn.LayerNorm(reg_hidden),
+                nn.ReLU(inplace=True)
             ]
-            
             prev = reg_hidden
         reg += [nn.Linear(prev, 1)]
         self.reg_head = nn.Sequential(*reg)
 
-        # Classification head
+        # ── Classification head ─────────────────────────────────────────
         cls = []
         prev = last_trunk_dim
         for _ in range(cls_layers):
@@ -126,16 +141,16 @@ class MultiHeadNet(nn.Module):
                 nn.LayerNorm(cls_hidden),
                 nn.ReLU(inplace=True)
             ]
-            
             prev = cls_hidden
         cls += [nn.Linear(prev, 1)]
         self.cls_head = nn.Sequential(*cls)
 
     def forward(self, x: torch.Tensor):
         features = self.trunk(x)
-        reg_out = self.reg_head(features)
-        cls_logits = self.cls_head(features)
-        return reg_out.squeeze(-1), cls_logits.squeeze(-1)
+        reg_out = self.reg_head(features).squeeze(-1)
+        cls_logits = self.cls_head(features).squeeze(-1)
+        return reg_out, cls_logits
+
 
 
 
@@ -185,6 +200,7 @@ class MultiHeadLightning(pl.LightningModule):
             cls_hidden   = config['cls_hidden'],
             dropout_rate = config['dropout_rate'],
             last_trunk_dim=config['trunk_final_layer_dim']
+        
         )
         self.mse_loss = nn.MSELoss()
         self.bce_loss = nn.BCEWithLogitsLoss()
@@ -216,8 +232,6 @@ class MultiHeadLightning(pl.LightningModule):
 
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
-
-        
         self._val_step_start = time.perf_counter()
 
         Xb, yb_reg, yb_cls = batch_to_tensor(batch, self.device)
@@ -228,10 +242,28 @@ class MultiHeadLightning(pl.LightningModule):
         cls_loss = self.bce_loss(pred_cls_logits.squeeze(-1), yb_cls)
         loss = reg_loss + cls_loss
 
+        # ─────────────────────────────────────────────
+        # Define all validation loader names in order
+        # ─────────────────────────────────────────────
+        names = [
+            "val_main",
+            "val_0_2",
+            "val_0_781",
+            "val_1_2",
+            "val_3_13",
+            "val_7_9",
+            "val_12_50",
+            "val_50"
+        ]
+
+        # ─────────────────────────────────────────────
+        # Log metrics
+        # ─────────────────────────────────────────────
         if dataloader_idx == 0:
+            # Split regression losses by actives/inactives
             active_mask = (yb_cls == 1)
             inactive_mask = ~active_mask
-            
+
             if active_mask.any():
                 reg_loss_act = self.mse_loss(pred_reg[active_mask], yb_reg[active_mask])
             else:
@@ -241,21 +273,22 @@ class MultiHeadLightning(pl.LightningModule):
             else:
                 reg_loss_inact = torch.tensor(0.0, device=self.device)
 
-            self.log("val_main/reg_loss", reg_loss, on_epoch=True, sync_dist=False)
-            self.log("val_main/cls_loss", cls_loss, on_epoch=True, sync_dist=False)
-            self.log("val_main/loss", loss, on_epoch=True, sync_dist=False)
-            self.log("val_main/reg_loss_actives", reg_loss_act, on_epoch=True, sync_dist=False)
-            self.log("val_main/reg_loss_inactives", reg_loss_inact, on_epoch=True, sync_dist=False)
+            self.log(f"{names[0]}/reg_loss", reg_loss, on_epoch=True, sync_dist=False)
+            self.log(f"{names[0]}/cls_loss", cls_loss, on_epoch=True, sync_dist=False)
+            self.log(f"{names[0]}/loss", loss, on_epoch=True, sync_dist=False)
+            self.log(f"{names[0]}/reg_loss_actives", reg_loss_act, on_epoch=True, sync_dist=False)
+            self.log(f"{names[0]}/reg_loss_inactives", reg_loss_inact, on_epoch=True, sync_dist=False)
             self.log("val_loss", loss, on_epoch=True, prog_bar=True, sync_dist=False)
         else:
-            names = ["val_0_781","val_3_13","val_12_50"]
-            self.log(f"{names[dataloader_idx-1]}/loss", loss, on_epoch=True, sync_dist=False)
-        
-        name = ["val_main","val_0_781","val_3_13","val_12_50"][dataloader_idx]
+            self.log(f"{names[dataloader_idx]}/loss", loss, on_epoch=True, sync_dist=False)
 
-        # ---- Update per (t,c) metrics ----
+        # ─────────────────────────────────────────────
+        # Store per-(t,c) subgroup metrics
+        # ─────────────────────────────────────────────
+        name = names[dataloader_idx]
         t = batch["t_raw"].detach()
         c = batch["c_raw"].detach()
+
         for ti, ci, r_pr, r_tr, c_pr, c_tr in zip(t, c, pred_reg, yb_reg, pred_cls_probs, yb_cls):
             key = (dataloader_idx, round(ti.item(), 2), round(ci.item(), 3))
             g = self.val_outputs[key]
@@ -264,13 +297,12 @@ class MultiHeadLightning(pl.LightningModule):
             g["c_pred"].append(c_pr.detach().cpu())
             g["c_true"].append(c_tr.detach().cpu())
             g["n"] += 1
-        
-        
-        elapsed = time.perf_counter() - self._val_step_start
-        print(f"validation_step took {elapsed:.4f} seconds (loader {dataloader_idx}, batch {batch_idx})")
 
-        
+        elapsed = time.perf_counter() - self._val_step_start
+        print(f"validation_step took {elapsed:.4f}s (loader {dataloader_idx}, batch {batch_idx}, {name})")
+
         return loss
+
     
     def on_validation_epoch_end(self):
         
@@ -300,49 +332,59 @@ class MultiHeadLightning(pl.LightningModule):
             rec = recall(c_pred > 0.5, c_true, task="binary") if c_true.sum() > 0 else torch.tensor(0.0)
 
             # store per-subgroup results
-            by_loader[loader_idx].append((g["n"], mae, pearson, auc, ap, f1, rec))
+            by_loader[loader_idx].append((mae, pearson, auc, ap, f1, rec))
+        
+        names = [
+            "val_main",
+            "val_0_2",
+            "val_0_781",
+            "val_1_2",
+            "val_3_13",
+            "val_7_9",
+            "val_12_50",
+            "val_50"
+        ]
+        
+        
 
-        # Clear for next epoch
-        self.val_outputs.clear()
-
-        # Compute weighted means by loader
-        names = ["val_main", "val_0_781", "val_3_13", "val_12_50"]
+        
         for idx, rows in by_loader.items():
-            total = sum(n for n, *_ in rows)
+            
+            def mean_metric(i):
+                return sum(r[i] for r in rows) / len(rows)
 
-            def wmean(i):
-                return sum(n * r[i] for n, *r in rows) / total if total > 0 else 0.0
-
-            mae_w  = wmean(0)
-            pear_w = wmean(1)
-            auc_w  = wmean(2)
-            ap_w   = wmean(3)
-            f1_w   = wmean(4)
-            rec_w  = wmean(5)
+            mae_m  = mean_metric(0)
+            pear_m = mean_metric(1)
+            auc_m  = mean_metric(2)
+            ap_m  = mean_metric(3)
+            f1_m   = mean_metric(4)
+            rec_m  = mean_metric(5)
 
             
-            agg = ap_w + auc_w - mae_w + pear_w
+            agg = ap_m-5*mae_m + pear_m
 
             # Log everything
-            self.log(f"{names[idx]}/mae_active", mae_w, sync_dist=False)
-            self.log(f"{names[idx]}/pearson_active", pear_w, sync_dist=False)
-            self.log(f"{names[idx]}/auc", auc_w, sync_dist=False)
-            self.log(f"{names[idx]}/ap", ap_w, sync_dist=False)
-            self.log(f"{names[idx]}/f1", f1_w, sync_dist=False)
-            self.log(f"{names[idx]}/recall", rec_w, sync_dist=False)
-            self.log(f"{names[idx]}/AP+AUC-MAE+Pearson", agg,
+            self.log(f"{names[idx]}/mae_active", mae_m, sync_dist=False)
+            self.log(f"{names[idx]}/pearson_active", pear_m, sync_dist=False)
+            self.log(f"{names[idx]}/auc", auc_m, sync_dist=False)
+            self.log(f"{names[idx]}/ap", ap_m, sync_dist=False)
+            self.log(f"{names[idx]}/f1", f1_m, sync_dist=False)
+            self.log(f"{names[idx]}/recall", rec_m, sync_dist=False)
+            self.log(f"{names[idx]}/AP+Pearson-5*MAE", agg,
                     prog_bar=True, sync_dist=False)
 
             # Track best agg on val_main
             if idx == 0:
                 if agg > getattr(self, "best_val_main_agg", float("-inf")):
                     self.best_val_main_agg = agg
+                    self.best_val_main_epoch = self.current_epoch  # record epoch
                 self.log("val_main/best_agg_metric", self.best_val_main_agg,
                         prog_bar=True, sync_dist=False)
+                self.log("val_main/best_agg_epoch", getattr(self, "best_val_main_epoch", -1),
+                        prog_bar=False, sync_dist=False)
 
-        
-        
-
+        self.val_outputs.clear()
+            
 
 
     def configure_optimizers(self):
@@ -363,14 +405,27 @@ class MultiHeadLightning(pl.LightningModule):
 # DATAMODULE
 # ─────────────────────────────────────────────────────────────
 class GrowthCurveDataModule(pl.LightningDataModule):
-    def __init__(self, config, df_train, dict_val_main, dict_val_0_781, dict_val_3_13, dict_val_12_50):
+    def __init__(self, config, df_train, dict_val_main, 
+                 dict_val_0_2,
+                 dict_val_0_781,
+                 dict_val_1_2,
+                 dict_val_3_13,
+                 dict_val_7_9,
+                 dict_val_12_50,
+                 dict_val_50
+                ):
         super().__init__()
         self.config = config
         self.df_train = df_train
         self.dict_val_main = dict_val_main
+        self.dict_val_0_2 = dict_val_0_2
         self.dict_val_0_781 = dict_val_0_781
+        self.dict_val_1_2 = dict_val_1_2
         self.dict_val_3_13 = dict_val_3_13
+        self.dict_val_7_9 = dict_val_7_9
         self.dict_val_12_50 = dict_val_12_50
+        self.dict_val_50 = dict_val_50
+
 
     def setup(self, stage=None):
         #self.train_ds = PerCompoundDataset(
@@ -383,7 +438,7 @@ class GrowthCurveDataModule(pl.LightningDataModule):
         epoch = getattr(self.trainer, "current_epoch", 0)
 
         self.train_ds = PerCompoundDataset(
-           self.df_train, k=self.config['samples'], seed=self.config['seed']+ epoch, num_fourier=3
+           self.df_train, k=self.config['samples'], seed=self.config['seed']+ epoch, num_fourier=3, noise=self.config['regression_noise']
         )
 
         
@@ -419,9 +474,13 @@ class GrowthCurveDataModule(pl.LightningDataModule):
 
         return [
             DataLoader(DictDataset(self.dict_val_main),  batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True),
+            DataLoader(DictDataset(self.dict_val_0_2),   batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True),
             DataLoader(DictDataset(self.dict_val_0_781), batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True),
+            DataLoader(DictDataset(self.dict_val_1_2),   batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True),
             DataLoader(DictDataset(self.dict_val_3_13),  batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True),
+            DataLoader(DictDataset(self.dict_val_7_9),   batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True),
             DataLoader(DictDataset(self.dict_val_12_50), batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True),
+            DataLoader(DictDataset(self.dict_val_50),    batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True)
         ]
     
 
@@ -442,15 +501,32 @@ def main():
         pass
 
     # ── Load data ──
-    df_train = pd.read_pickle("/home/ethan2/GrowthCurve/data/train/df_well_train_mad_4.pkl")
-    with open("/home/ethan2/GrowthCurve/data/test/dict_test_fourier_k_3.pkl", "rb") as f:
+    df_train = pd.read_pickle("/home/ethan2/GrowthCurve/data/train/df_well_train_Celine_clusters_mad_4.pkl")
+
+    with open("/home/ethan2/GrowthCurve/data/test/dict_val_fourier_k_3_Celine.pkl", "rb") as f:
         dict_test = pickle.load(f)
-    with open("/home/ethan2/GrowthCurve/data/test/dict_test_fourier_k_3_conc_0_781.pkl", "rb") as f:
+
+    with open("/home/ethan2/GrowthCurve/data/test/dict_val_fourier_k_3_conc_0_2_Celine.pkl", "rb") as f:
+        dict_test_conc_0_2 = pickle.load(f)
+    
+
+    with open("/home/ethan2/GrowthCurve/data/test/dict_val_fourier_k_3_conc_0_781_Celine.pkl", "rb") as f:
         dict_test_conc_0_781 = pickle.load(f)
-    with open("/home/ethan2/GrowthCurve/data/test/dict_test_fourier_k_3_conc_3_13.pkl", "rb") as f:
+
+    with open("/home/ethan2/GrowthCurve/data/test/dict_val_fourier_k_3_conc_1_2_Celine.pkl", "rb") as f:
+        dict_test_conc_1_2 = pickle.load(f)
+
+    with open("/home/ethan2/GrowthCurve/data/test/dict_val_fourier_k_3_conc_3_13_Celine.pkl", "rb") as f:
         dict_test_conc_3_13 = pickle.load(f)
-    with open("/home/ethan2/GrowthCurve/data/test/dict_test_fourier_k_3_conc_12_50.pkl", "rb") as f:
+
+    with open("/home/ethan2/GrowthCurve/data/test/dict_val_fourier_k_3_conc_7_9_Celine.pkl", "rb") as f:
+        dict_test_conc_7_9 = pickle.load(f)
+
+    with open("/home/ethan2/GrowthCurve/data/test/dict_val_fourier_k_3_conc_12_50_Celine.pkl", "rb") as f:
         dict_test_conc_12_50 = pickle.load(f)
+
+    with open("/home/ethan2/GrowthCurve/data/test/dict_val_fourier_k_3_conc_50_Celine.pkl", "rb") as f:
+        dict_test_conc_50 = pickle.load(f)
 
     # Infer input_dim from one prepared batch
     Xte, _, _ = batch_to_tensor(dict_test, torch.device("cpu"))
@@ -460,9 +536,13 @@ def main():
         config,
         df_train,
         dict_test,
+        dict_test_conc_0_2,
         dict_test_conc_0_781,
+        dict_test_conc_1_2,
         dict_test_conc_3_13,
+        dict_test_conc_7_9,
         dict_test_conc_12_50,
+        dict_test_conc_50
     )
     model = MultiHeadLightning(input_dim=Xte.shape[1], config=config)
 
@@ -484,7 +564,7 @@ def main():
     checkpoint_cb = ModelCheckpoint(
         dirpath=save_dir,
         filename="best_params",
-        monitor="val_main/AP+AUC-MAE+Pearson",   # metric you log
+        monitor="val_main/AP+Pearson-5*MAE",   # metric you log
         mode="max",                              # maximize agg metric
         save_top_k=1,                            # only keep the best
         save_last=False,                          # also save the last epoch

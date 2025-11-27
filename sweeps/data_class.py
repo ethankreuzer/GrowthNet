@@ -56,7 +56,7 @@ class PerCompoundDataset(Dataset):
         k: int, 
         seed: Optional[int] = None,
         num_fourier: int,
-        # Control which fingerprint families to include; None = include all present
+        noise:float,
         compounds: Optional[Iterable[str]] = None, #if wanted to only train on these compounds
     ):
         
@@ -66,9 +66,10 @@ class PerCompoundDataset(Dataset):
 
         self.num_fourier = int(num_fourier)
         self.k = int(k)
-        self.rbs_reg = {'kx': 2, 'ky': 2, 's': 0.0}
-        self.kx = int(self.rbs_reg.get('kx', 2))
-        self.ky = int(self.rbs_reg.get('ky', 2))
+        self.rbs_reg = {'kx': 1, 'ky': 1, 's': 0.0}
+        self.kx = int(self.rbs_reg.get('kx'))
+        self.ky = int(self.rbs_reg.get('ky'))
+        self.noise=noise
 
 
         self.rng = np.random.default_rng(seed)
@@ -85,7 +86,7 @@ class PerCompoundDataset(Dataset):
         self._metas: List[CompoundMeta] = []
 
 
-        with open("/home/ethan2/GrowthCurve/data/train/CompoundMetas_list.pkl", "rb") as f:
+        with open("/home/ethan2/GrowthCurve/data/train/Celine_CompoundMetas_list.pkl", "rb") as f:
             saved_metas=pickle.load(f)
 
 
@@ -108,13 +109,14 @@ class PerCompoundDataset(Dataset):
 
         for i in range(self.k):
             
-            t = self.rng.uniform(1e-3, meta.t_max)
+            t = self.rng.uniform(0, meta.t_max)
 
             if meta.single_conc:
                 
                 c = float(meta.c_vals[0]) #should be 50
 
                 y_r, y_c = self. _interpolate_single_conc(meta, t_samp=t, c_samp=c)  # placeholder
+                y_r = y_r + self.noise
 
             else:
                 
@@ -130,11 +132,17 @@ class PerCompoundDataset(Dataset):
                     c_vals=meta.c_vals, 
                     t_samp=t, 
                     c_samp=c, 
-                    labels_pivot=meta.pivot_cls,k=4
+                    labels_pivot=meta.pivot_cls,
+                    k=4
                 )
-            
+                y_r = y_r + self.noise
+
+            T = 15
+            t_prime= t - 1
+
             for j, k_freq in enumerate(range(1, self.num_fourier + 1)):
-                angle = 2 * np.pi * k_freq * t / self.max_time 
+                
+                angle = 2 * np.pi * k_freq * t_prime / T
                 t_enc_arr[i, 2*j]   = np.sin(angle)
                 t_enc_arr[i, 2*j+1] = np.cos(angle)
             
@@ -370,9 +378,15 @@ class ExplicitDataset(Dataset):
         label = int(row["is_Active"])
 
         # Fourier time encoding
+
         t_enc = np.zeros(2 * self.num_fourier, dtype=np.float32)
+
+        t_prime=t-1
+
+        T = 15
+
         for j, k_freq in enumerate(range(1, self.num_fourier + 1)):
-            angle = 2 * np.pi * k_freq * t / self.max_time
+            angle = 2 * np.pi * k_freq * t_prime / T
             t_enc[2 * j] = np.sin(angle)
             t_enc[2 * j + 1] = np.cos(angle)
 
