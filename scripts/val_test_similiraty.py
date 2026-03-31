@@ -8,9 +8,9 @@ import os
 # --------------------------
 # Load datasets
 # --------------------------
-df_train = pd.read_pickle("/home/ethan2/GrowthCurve/data/train/df_well_train_Celine_clusters_mad_4.pkl")
-#df_val   = pd.read_pickle("/home/ethan2/GrowthCurve/data/validation/df_well_validation_Celine_clusters_mad_4.pkl")
-df_test=pd.read_pickle('/home/ethan2/GrowthCurve/data/test/df_test_normalized_mean_OD_then_mad_4_t_12.pkl')
+df_train = pd.read_pickle("/home/ethan2/GrowthNet/data/train/df_well_train_Celine_clusters_mad_4.pkl")
+#df_val   = pd.read_pickle("/home/ethan2/GrowthNet/data/validation/df_well_validation_Celine_clusters_mad_4.pkl")
+df_test=pd.read_pickle('/home/ethan2/GrowthNet/data/test/df_test_normalized_mean_OD_then_mad_4_t_12.pkl')
 
 
 # --------------------------
@@ -81,7 +81,7 @@ def tanimoto_batch_reverse(B, A, batch_size=500):
     return max_sims
 
 
-output_dir = "/home/ethan2/GrowthCurve/plots/similarity"
+output_dir = "/home/ethan2/GrowthNet/plots/similarity"
 os.makedirs(output_dir, exist_ok=True)
 
 # Compute max similarity per validation compound

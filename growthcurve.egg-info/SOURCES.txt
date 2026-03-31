@@ -1,0 +1,6 @@
+pyproject.toml
+growthcurve.egg-info/PKG-INFO
+growthcurve.egg-info/SOURCES.txt
+growthcurve.egg-info/dependency_links.txt
+growthcurve.egg-info/requires.txt
+growthcurve.egg-info/top_level.txt

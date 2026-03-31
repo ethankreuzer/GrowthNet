@@ -1,7 +1,9 @@
 models/
 *.out
+.venv/
 *.log
 plots/
 wandb/
 data/
+.claude/
 __pycache__/

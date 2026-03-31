@@ -99,8 +99,8 @@ def train():
     norm = config.normalization  # Should be exactly "no_corr", "well", or "plate_t12"
 
     # Build file paths based on this fixed normalization
-    train_path = f"/home/ethan2/GrowthCurve/data/train/df_{norm}_train_mad_4.pkl"
-    test_path  = f"/home/ethan2/GrowthCurve/data/test/df_{norm}_test_mad_4.pkl"
+    train_path = f"/home/ethan2/GrowthNet/data/train/df_{norm}_train_mad_4.pkl"
+    test_path  = f"/home/ethan2/GrowthNet/data/test/df_{norm}_test_mad_4.pkl"
 
     try:
         df_train = pd.read_pickle(train_path)
@@ -238,7 +238,7 @@ def train():
     # Save best model to disk
     model.load_state_dict(best_model_state)
     model_filename = f"best_model_{norm}_{wandb.run.id}.pt"
-    output_dir = f"/home/ethan2/GrowthCurve/experiments/normalizations/{norm}"
+    output_dir = f"/home/ethan2/GrowthNet/experiments/normalizations/{norm}"
     torch.save(model.state_dict(), f"{output_dir}/{model_filename}")
 
     art = wandb.Artifact(

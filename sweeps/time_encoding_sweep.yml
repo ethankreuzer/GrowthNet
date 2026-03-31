@@ -6,7 +6,7 @@ command:
   - accelerate
   - launch
   - --num_processes=3
-  - /home/ethan2/GrowthCurve/time_encoding_sweep.py
+  - /home/ethan2/GrowthNet/time_encoding_sweep.py
   - ${args}                # W&B will expand flags here
 
 method: bayes

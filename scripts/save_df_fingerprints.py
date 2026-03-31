@@ -15,9 +15,9 @@ from rdkit.Chem.Scaffolds import MurckoScaffold
 from multiprocessing import Pool, cpu_count
 import os
 
-df_no_correction=pd.read_pickle('/home/ethan2/GrowthCurve/data/df_no_correction.pkl')
-df_well=pd.read_pickle('/home/ethan2/GrowthCurve/data/df_well_corrected.pkl')
-df_plate_t12=pd.read_pickle('/home/ethan2/GrowthCurve/data/df_well_plate_correction_t12.pkl')
+df_no_correction=pd.read_pickle('/home/ethan2/GrowthNet/data/df_no_correction.pkl')
+df_well=pd.read_pickle('/home/ethan2/GrowthNet/data/df_well_corrected.pkl')
+df_plate_t12=pd.read_pickle('/home/ethan2/GrowthNet/data/df_well_plate_correction_t12.pkl')
 
 
 # In[5]:
@@ -98,7 +98,7 @@ if __name__ == "__main__":
 
     fps_df = pd.DataFrame(rows)
 
-    output_dir = "/home/ethan2/GrowthCurve/data/"
+    output_dir = "/home/ethan2/GrowthNet/data/"
     for name, df in [
         ("df_no_correction",  df_no_correction),
         ("df_well",           df_well),

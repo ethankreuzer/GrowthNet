@@ -10,8 +10,8 @@ import pandas as pd
 import time
 
 # === CONFIG ===
-INPUT_PATH = "/home/ethan2/GrowthCurve/data/validation/df_well_validation_Celine_clusters_mad_4.pkl"
-OUTPUT_PATH = "/home/ethan2/GrowthCurve/data/validation/df_well_validation_Celine_dense_timepoints_original_concs.pkl"
+INPUT_PATH = "/home/ethan2/GrowthNet/data/validation/df_well_validation_Celine_clusters_mad_4.pkl"
+OUTPUT_PATH = "/home/ethan2/GrowthNet/data/validation/df_well_validation_Celine_dense_timepoints_original_concs.pkl"
 
 TIME_START = 0.0
 TIME_END = 13.0

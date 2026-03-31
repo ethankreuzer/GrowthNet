@@ -86,7 +86,7 @@ class PerCompoundDataset(Dataset):
         self._metas: List[CompoundMeta] = []
 
 
-        with open("/home/ethan2/GrowthCurve/data/train/Celine_CompoundMetas_list.pkl", "rb") as f:
+        with open("/home/ethan2/GrowthNet/data/train/Celine_CompoundMetas_list.pkl", "rb") as f:
             saved_metas=pickle.load(f)
 
 

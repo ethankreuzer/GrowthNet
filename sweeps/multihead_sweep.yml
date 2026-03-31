@@ -3,7 +3,7 @@ entity: ethan_personal
 
 command:
   - python
-  - /home/ethan2/GrowthCurve/sweeps/sweep_multihead_lightning.py
+  - /home/ethan2/GrowthNet/sweeps/sweep_multihead_lightning.py
   - ${args}                # W&B will expand flags here
 
 method: bayes
@@ -15,12 +15,12 @@ parameters:
 
   samples:
     distribution: int_uniform
-    min: 3
-    max: 30
+    min: 15
+    max: 25
 
   weight_decay:
     distribution: log_uniform_values
-    min: 0.000001
+    min: 0.00001
     max: 0.001
 
   seed:
@@ -28,63 +28,60 @@ parameters:
 
   loss_lambda:
     distribution: log_uniform_values
-    min: 0.1
+    min: 5
     max: 15
 
   max_learning_rate:
     distribution: log_uniform_values
-    min: 0.00001
-    max: 0.01
+    min: 0.005
+    max: 0.05
 
   dropout_rate:
     distribution: uniform
     min: 0.0
-    max: 0.6
+    max: 0.3
 
   active_fraction:
     distribution: uniform
-    min: 0.1
-    max: 0.7
+    min: 0.3
+    max: 0.5
 
   batch_size:
     distribution: q_log_uniform_values
-    min: 4
-    max: 124
+    min: 5
+    max: 25
 
   epochs:
     distribution: q_log_uniform_values
-    min: 10
-    max: 200
+    min: 175
+    max: 250
 
   trunk_layers:
-    values: [1,2,3,4,5]
+    values: [1]
 
   trunk_dim:
     distribution: q_log_uniform_values
-    min: 16
-    max: 1024
-
-  trunk_final_layer_dim:
-    distribution: q_log_uniform_values
-    min: 4
-    max: 1024
+    min: 450
+    max: 700
 
   reg_layers:
-    values: [1,2,3,4]
+    values: [2,3,4,5]
 
   reg_hidden:  
     distribution: q_log_uniform_values
-    min: 4
-    max: 256
+    min: 16
+    max: 128
 
   cls_layers: 
-    values: [0,1,2]
+    values: [0,1,2,3,4]
 
   cls_hidden:
     distribution: q_log_uniform_values
-    min: 4
-    max: 256
+    min: 16
+    max: 129
 
   regression_noise:
-    values: [0.0,0, 0.00025, 0.0005, 0.01, 0.025, 0.05, 0.075, 0.1]
-    
+    values: [0.0, 0.00025, 0.0005, 0.001, 0.005]
+
+  feature_set:
+    values: ["minimol_classic"]

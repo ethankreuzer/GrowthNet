@@ -14,12 +14,12 @@ import os
 # In[14]:
 
 
-Celine_train=pd.read_csv('/home/ethan2/GrowthCurve/data/Brun_Arroyo_cluster_split_train.csv')
-Celine_test=pd.read_csv('/home/ethan2/GrowthCurve/data/Brun_Arroyo_cluster_split_test.csv')
+Celine_train=pd.read_csv('/home/ethan2/GrowthNet/data/Brun_Arroyo_cluster_split_train.csv')
+Celine_test=pd.read_csv('/home/ethan2/GrowthNet/data/Brun_Arroyo_cluster_split_test.csv')
 
 
-df_train = pd.read_pickle("/home/ethan2/GrowthCurve/data/train/df_well_train_mad_4.pkl")
-df_val  = pd.read_pickle("/home/ethan2/GrowthCurve/data/validation/df_well_test_mad_4.pkl") 
+df_train = pd.read_pickle("/home/ethan2/GrowthNet/data/train/df_well_train_mad_4.pkl")
+df_val  = pd.read_pickle("/home/ethan2/GrowthNet/data/validation/df_well_test_mad_4.pkl") 
 
 
 # Make my smiles match hers
@@ -208,7 +208,7 @@ plt.ylabel("Training Compounds")
 plt.tight_layout()
 
 # --- Step 5: Save to file ---
-save_path = "/home/ethan2/GrowthCurve/plots/tanimoto_sim.png"
+save_path = "/home/ethan2/GrowthNet/plots/tanimoto_sim.png"
 os.makedirs(os.path.dirname(save_path), exist_ok=True)
 plt.savefig(save_path, dpi=300, bbox_inches="tight")
 plt.close()

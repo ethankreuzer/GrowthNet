@@ -10,7 +10,6 @@ import torch.nn as nn
 import pytorch_lightning as pl
 import torch.distributed as dist
 import json
-import matplotlib.pyplot as plt
 import pandas as pd
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -45,6 +44,14 @@ from data_class import PerCompoundDataset, ExplicitDataset, custom_collate, Comp
 # --- add imports ---
 import argparse
 
+FEATURE_SETS = {
+    "minimol": ["minimol_fp"],
+    "boltz2_minimol": ["boltz2_rep", "minimol_fp"],
+    "boltz2_classic": ["boltz2_rep", "ecfp_fp", "maccs_fp", "rdkit_fp"],
+    "minimol_classic": ["minimol_fp", "ecfp_fp", "maccs_fp", "rdkit_fp"],
+    "boltz2_minimol_classic": ["boltz2_rep", "minimol_fp", "ecfp_fp", "maccs_fp", "rdkit_fp"],
+}
+
 def parse_args():
     p = argparse.ArgumentParser()
     # match the sweep yaml keys
@@ -59,12 +66,12 @@ def parse_args():
     p.add_argument("--epochs", type=int)
     p.add_argument("--trunk_layers", type=int)
     p.add_argument("--trunk_dim", type=int)
-    p.add_argument("--trunk_final_layer_dim", type=int)
     p.add_argument("--reg_layers", type=int)
     p.add_argument("--reg_hidden", type=int)
     p.add_argument("--cls_layers", type=int)
     p.add_argument("--cls_hidden", type=int)
     p.add_argument("--regression_noise", type=float)
+    p.add_argument("--feature_set", type=str, default="all")
     
     return vars(p.parse_args())
 
@@ -77,7 +84,6 @@ class MultiHeadNet(nn.Module):
                  input_dim: int,
                  trunk_layers: int,
                  trunk_dim: int,
-                 last_trunk_dim: int,
                  reg_layers: int,
                  reg_hidden: int,
                  cls_layers: int,
@@ -88,40 +94,20 @@ class MultiHeadNet(nn.Module):
         # ── Shared trunk ────────────────────────────────────────────────
         trunk = []
         prev_dim = input_dim
-
-        if trunk_layers > 1: 
-            
-            for _ in range(trunk_layers - 1):
-                trunk += [
-                    nn.Linear(prev_dim, trunk_dim),
-                    nn.LayerNorm(trunk_dim),
-                    nn.ReLU(inplace=True),
-                    nn.Dropout(dropout_rate),
-                ]
-                prev_dim = trunk_dim
-            
-            
-            trunk += [
-                nn.Linear(trunk_dim, last_trunk_dim),
-                nn.LayerNorm(last_trunk_dim),
-                nn.ReLU(inplace=True),
-                nn.Dropout(dropout_rate)
-            ]
-        else:
-            
+        for _ in range(trunk_layers):
             trunk += [
                 nn.Linear(prev_dim, trunk_dim),
                 nn.LayerNorm(trunk_dim),
                 nn.ReLU(inplace=True),
                 nn.Dropout(dropout_rate),
             ]
-            last_trunk_dim = trunk_dim  # ← Masking fix
+            prev_dim = trunk_dim
 
         self.trunk = nn.Sequential(*trunk)
 
         # ── Regression head ─────────────────────────────────────────────
         reg = []
-        prev = last_trunk_dim
+        prev = trunk_dim
         for _ in range(reg_layers):
             reg += [
                 nn.Linear(prev, reg_hidden),
@@ -134,7 +120,7 @@ class MultiHeadNet(nn.Module):
 
         # ── Classification head ─────────────────────────────────────────
         cls = []
-        prev = last_trunk_dim
+        prev = trunk_dim
         for _ in range(cls_layers):
             cls += [
                 nn.Linear(prev, cls_hidden),
@@ -154,7 +140,7 @@ class MultiHeadNet(nn.Module):
 
 
 
-def batch_to_tensor(batch: dict, device: torch.device):
+def batch_to_tensor(batch: dict, device: torch.device, feature_set: str = "all"):
     if batch["t_fourier"].ndim == 3:       # (N, k, 2*num_fourier) → training
         N, k, _ = batch["t_fourier"].shape
         t_feats = batch["t_fourier"].reshape(N * k, -1)
@@ -174,8 +160,9 @@ def batch_to_tensor(batch: dict, device: torch.device):
     else:
         raise ValueError(f"Unexpected t_fourier shape {batch['t_fourier'].shape}")
 
+    families = FEATURE_SETS[feature_set]
     feats = [t_feats, c_raw, c_log]
-    for fam in sorted(batch["features_by_family"].keys()):
+    for fam in sorted(families):
         feats.append(batch["features_by_family"][fam].repeat_interleave(repeats, dim=0))
     feats = [f.to(device) for f in feats]
 
@@ -199,8 +186,6 @@ class MultiHeadLightning(pl.LightningModule):
             cls_layers   = config['cls_layers'],
             cls_hidden   = config['cls_hidden'],
             dropout_rate = config['dropout_rate'],
-            last_trunk_dim=config['trunk_final_layer_dim']
-        
         )
         self.mse_loss = nn.MSELoss()
         self.bce_loss = nn.BCEWithLogitsLoss()
@@ -215,8 +200,8 @@ class MultiHeadLightning(pl.LightningModule):
     def forward(self, x):
         return self.model(x)
 
-    def training_step(self, batch, batch_idx): #what is batch_idx here?
-        Xb, yb_reg, yb_cls = batch_to_tensor(batch, self.device)
+    def training_step(self, batch, batch_idx):
+        Xb, yb_reg, yb_cls = batch_to_tensor(batch, self.device, feature_set=self.hparams.feature_set)
         out_reg, out_cls_logits = self(Xb)
 
         loss_reg = self.mse_loss(out_reg, yb_reg)
@@ -234,7 +219,7 @@ class MultiHeadLightning(pl.LightningModule):
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         self._val_step_start = time.perf_counter()
 
-        Xb, yb_reg, yb_cls = batch_to_tensor(batch, self.device)
+        Xb, yb_reg, yb_cls = batch_to_tensor(batch, self.device, feature_set=self.hparams.feature_set)
         pred_reg, pred_cls_logits = self(Xb)
         pred_cls_probs = torch.sigmoid(pred_cls_logits)
 
@@ -404,7 +389,7 @@ class MultiHeadLightning(pl.LightningModule):
 # ─────────────────────────────────────────────────────────────
 # DATAMODULE
 # ─────────────────────────────────────────────────────────────
-class GrowthCurveDataModule(pl.LightningDataModule):
+class GrowthNetDataModule(pl.LightningDataModule):
     def __init__(self, config, df_train, dict_val_main, 
                  dict_val_0_2,
                  dict_val_0_781,
@@ -493,6 +478,17 @@ def main():
     # Parse sweep-injected CLI args
     config = parse_args()
 
+    # wandb's ${args} expansion can silently drop string categorical
+    # parameters.  Init the run early so we can read them from the
+    # server-side sweep config and merge anything that was missing.
+    run = wandb.init()
+    if run is not None:
+        for k, v in run.config.items():
+            if k in config and v is not None:
+                config[k] = v
+
+    print(f"[sweep_multihead] Resolved feature_set = {config['feature_set']}")
+
     # Reproducibility + matmul perf
     pl.seed_everything(config['seed'], workers=True)
     try:
@@ -501,38 +497,38 @@ def main():
         pass
 
     # ── Load data ──
-    df_train = pd.read_pickle("/home/ethan2/GrowthCurve/data/train/df_well_train_Celine_clusters_mad_4.pkl")
+    df_train = pd.read_pickle("/home/ethan2/GrowthNet/data/train/df_well_train_Celine_clusters_mad_4.pkl")
 
-    with open("/home/ethan2/GrowthCurve/data/test/dict_val_fourier_k_3_Celine.pkl", "rb") as f:
+    with open("/home/ethan2/GrowthNet/data/test/dict_val_fourier_k_3_Celine.pkl", "rb") as f:
         dict_test = pickle.load(f)
 
-    with open("/home/ethan2/GrowthCurve/data/test/dict_val_fourier_k_3_conc_0_2_Celine.pkl", "rb") as f:
+    with open("/home/ethan2/GrowthNet/data/test/dict_val_fourier_k_3_conc_0_2_Celine.pkl", "rb") as f:
         dict_test_conc_0_2 = pickle.load(f)
     
 
-    with open("/home/ethan2/GrowthCurve/data/test/dict_val_fourier_k_3_conc_0_781_Celine.pkl", "rb") as f:
+    with open("/home/ethan2/GrowthNet/data/test/dict_val_fourier_k_3_conc_0_781_Celine.pkl", "rb") as f:
         dict_test_conc_0_781 = pickle.load(f)
 
-    with open("/home/ethan2/GrowthCurve/data/test/dict_val_fourier_k_3_conc_1_2_Celine.pkl", "rb") as f:
+    with open("/home/ethan2/GrowthNet/data/test/dict_val_fourier_k_3_conc_1_2_Celine.pkl", "rb") as f:
         dict_test_conc_1_2 = pickle.load(f)
 
-    with open("/home/ethan2/GrowthCurve/data/test/dict_val_fourier_k_3_conc_3_13_Celine.pkl", "rb") as f:
+    with open("/home/ethan2/GrowthNet/data/test/dict_val_fourier_k_3_conc_3_13_Celine.pkl", "rb") as f:
         dict_test_conc_3_13 = pickle.load(f)
 
-    with open("/home/ethan2/GrowthCurve/data/test/dict_val_fourier_k_3_conc_7_9_Celine.pkl", "rb") as f:
+    with open("/home/ethan2/GrowthNet/data/test/dict_val_fourier_k_3_conc_7_9_Celine.pkl", "rb") as f:
         dict_test_conc_7_9 = pickle.load(f)
 
-    with open("/home/ethan2/GrowthCurve/data/test/dict_val_fourier_k_3_conc_12_50_Celine.pkl", "rb") as f:
+    with open("/home/ethan2/GrowthNet/data/test/dict_val_fourier_k_3_conc_12_50_Celine.pkl", "rb") as f:
         dict_test_conc_12_50 = pickle.load(f)
 
-    with open("/home/ethan2/GrowthCurve/data/test/dict_val_fourier_k_3_conc_50_Celine.pkl", "rb") as f:
+    with open("/home/ethan2/GrowthNet/data/test/dict_val_fourier_k_3_conc_50_Celine.pkl", "rb") as f:
         dict_test_conc_50 = pickle.load(f)
 
     # Infer input_dim from one prepared batch
-    Xte, _, _ = batch_to_tensor(dict_test, torch.device("cpu"))
+    Xte, _, _ = batch_to_tensor(dict_test, torch.device("cpu"), feature_set=config['feature_set'])
 
     # DataModule & Model
-    dm = GrowthCurveDataModule(
+    dm = GrowthNetDataModule(
         config,
         df_train,
         dict_test,
@@ -557,7 +553,7 @@ def main():
     
     run_id = wandb.run.id if wandb.run else "debug"
 
-    save_dir = f'/home/ethan2/GrowthCurve/models/final_sweep/checkpoints/{run_id}'
+    save_dir = f'/home/ethan2/GrowthNet/models/final_sweep/checkpoints/{run_id}'
 
     os.makedirs(save_dir, exist_ok=True)
 

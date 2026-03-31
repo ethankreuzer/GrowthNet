@@ -222,7 +222,7 @@ def main(args):
     ###LOAD the model for inference
 
     run_id = args.run_id   # replace with your run ID
-    save_dir = Path(f"/home/ethan2/GrowthCurve/models/final_sweep/checkpoints/{run_id}")
+    save_dir = Path(f"/home/ethan2/GrowthNet/models/final_sweep/checkpoints/{run_id}")
     # Load hyperparameters
     with open(save_dir / "hparams.json") as f:
         hparams = json.load(f)
@@ -249,7 +249,7 @@ def main(args):
 
     # 2️⃣ Load trained model
     run_id = args.run_id
-    save_dir = Path(f"/home/ethan2/GrowthCurve/models/final_sweep/checkpoints/{run_id}")
+    save_dir = Path(f"/home/ethan2/GrowthNet/models/final_sweep/checkpoints/{run_id}")
 
     with open(save_dir / "hparams.json") as f:
         hparams = json.load(f)

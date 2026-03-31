@@ -264,20 +264,20 @@ def train():
 
     # ─── Load & augment DataFrames ─────────────────────────────────────────
     
-    df_train = pd.read_pickle("/home/ethan2/GrowthCurve/data/train/df_well_train_mad_4.pkl")
+    df_train = pd.read_pickle("/home/ethan2/GrowthNet/data/train/df_well_train_mad_4.pkl")
     
-    df_test  = pd.read_pickle("/home/ethan2/GrowthCurve/data/test/df_well_test_mad_4.pkl")   
+    df_test  = pd.read_pickle("/home/ethan2/GrowthNet/data/test/df_well_test_mad_4.pkl")   
     
-    with open("/home/ethan2/GrowthCurve/data/test/dict_test_fourier_k_3.pkl", "rb") as f:
+    with open("/home/ethan2/GrowthNet/data/test/dict_test_fourier_k_3.pkl", "rb") as f:
         dict_test = pickle.load(f) 
 
-    with open("/home/ethan2/GrowthCurve/data/test/dict_test_fourier_k_3_conc_0_781.pkl", "rb") as f:
+    with open("/home/ethan2/GrowthNet/data/test/dict_test_fourier_k_3_conc_0_781.pkl", "rb") as f:
         dict_test_conc_0_781 = pickle.load(f) 
 
-    with open("/home/ethan2/GrowthCurve/data/test/dict_test_fourier_k_3_conc_3_13.pkl", "rb") as f:
+    with open("/home/ethan2/GrowthNet/data/test/dict_test_fourier_k_3_conc_3_13.pkl", "rb") as f:
         dict_test_conc_3_13 = pickle.load(f)
 
-    with open("/home/ethan2/GrowthCurve/data/test/dict_test_fourier_k_3_conc_12_50.pkl", "rb") as f:
+    with open("/home/ethan2/GrowthNet/data/test/dict_test_fourier_k_3_conc_12_50.pkl", "rb") as f:
         dict_test_conc_12_50 = pickle.load(f)
 
     Xte, yte_reg, yte_cls = batch_to_tensor(dict_test, device)
@@ -313,7 +313,7 @@ def train():
     best_state    = None
 
     #if accelerator.is_main_process:
-    #    outdir = f"/home/ethan2/GrowthCurve/experiments/Multihead/{sweep_id}"
+    #    outdir = f"/home/ethan2/GrowthNet/experiments/Multihead/{sweep_id}"
     #    os.makedirs(outdir, exist_ok=True)                   
     #    best_ckpt = os.path.join(outdir,f"multihead_{run_id}_best.pt")
 

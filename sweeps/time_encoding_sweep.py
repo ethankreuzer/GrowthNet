@@ -145,8 +145,8 @@ def train():
 
     sweep_id = run.sweep_id 
     
-    df_train = pd.read_pickle("/home/ethan2/GrowthCurve/data/train/df_well_train_mad_4.pkl")
-    df_test  = pd.read_pickle("/home/ethan2/GrowthCurve/data/test/df_well_test_mad_4.pkl") 
+    df_train = pd.read_pickle("/home/ethan2/GrowthNet/data/train/df_well_train_mad_4.pkl")
+    df_test  = pd.read_pickle("/home/ethan2/GrowthNet/data/test/df_well_test_mad_4.pkl") 
 
     df_train = df_train[(df_train['Concentration'] == 50) & (df_train['Timepoint'] != 4.16) & (df_train['Timepoint'] != 10.4)].reset_index(drop=True)
     df_test  = df_test[df_test['Concentration'] == 50].reset_index(drop=True)
@@ -204,7 +204,7 @@ def train():
     )
 
     if accelerator.is_main_process:
-        outdir = f"/home/ethan2/GrowthCurve/experiments/time_encoding/{sweep_id}"
+        outdir = f"/home/ethan2/GrowthNet/experiments/time_encoding/{sweep_id}"
         os.makedirs(outdir, exist_ok=True)                   
         best_ckpt = os.path.join(outdir,f"time_enc_{config.encoding}_{run_id}_best.pt")
 
