@@ -15,12 +15,12 @@ parameters:
 
   samples:
     distribution: int_uniform
-    min: 15
-    max: 25
+    min: 20
+    max: 30
 
   weight_decay:
     distribution: log_uniform_values
-    min: 0.00001
+    min: 0.00005
     max: 0.001
 
   seed:
@@ -29,17 +29,32 @@ parameters:
   loss_lambda:
     distribution: log_uniform_values
     min: 5
-    max: 15
+    max: 10
 
   max_learning_rate:
     distribution: log_uniform_values
-    min: 0.005
+    min: 0.001
     max: 0.05
+
+  pct_start:
+    distribution: uniform
+    min: 0.05
+    max: 0.4
+
+  initial_lr_ratio:
+    distribution: uniform
+    min: 0.02
+    max: 0.1
+
+  final_lr_ratio:
+    distribution: log_uniform_values
+    min: 1.0e-5
+    max: 1.0e-3
 
   dropout_rate:
     distribution: uniform
-    min: 0.0
-    max: 0.3
+    min: 0.10
+    max: 0.25
 
   active_fraction:
     distribution: uniform
@@ -48,13 +63,13 @@ parameters:
 
   batch_size:
     distribution: q_log_uniform_values
-    min: 5
-    max: 25
+    min: 4
+    max: 15
 
   epochs:
     distribution: q_log_uniform_values
-    min: 175
-    max: 250
+    min: 150
+    max: 215
 
   trunk_layers:
     values: [1]
@@ -62,26 +77,24 @@ parameters:
   trunk_dim:
     distribution: q_log_uniform_values
     min: 450
-    max: 700
+    max: 600
 
   reg_layers:
-    values: [2,3,4,5]
+    values: [2,3,4]
 
   reg_hidden:  
     distribution: q_log_uniform_values
     min: 16
-    max: 128
+    max: 75
 
   cls_layers: 
-    values: [0,1,2,3,4]
+    values: [0]
 
   cls_hidden:
-    distribution: q_log_uniform_values
-    min: 16
-    max: 129
+    values: [0]
 
   regression_noise:
-    values: [0.0, 0.00025, 0.0005, 0.001, 0.005]
+    values: [0.0, 0.00025, 0.0005]
 
   feature_set:
     values: ["minimol_classic"]

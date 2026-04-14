@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # coding: utf-8
-import os, random, warnings, pickle
+import os, pickle, json
 os.environ.setdefault("WANDB_START_METHOD", "thread")  # safer under DDP
 
 import numpy as np
@@ -8,11 +8,8 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
-import torch.distributed as dist
-import json
-import pandas as pd
 from torch.utils.data import DataLoader, WeightedRandomSampler
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import OneCycleLR
 from pytorch_lightning.loggers import WandbLogger
 from collections import defaultdict
 from pytorch_lightning.callbacks import ModelCheckpoint
@@ -25,8 +22,6 @@ from torchmetrics.functional import (
     recall,
     pearson_corrcoef
 )
-import time
-
 # (optional but helpful on HPC)
 os.environ.setdefault("WANDB__SERVICE_WAIT", "600")
 os.environ.setdefault("WANDB_HTTP_TIMEOUT", "300")
@@ -38,10 +33,9 @@ import wandb
 # ─────────────────────────────────────────────────────────────
 # Import your custom datasets and collate
 # ─────────────────────────────────────────────────────────────
-from data_class import PerCompoundDataset, ExplicitDataset, custom_collate, CompoundMeta
+from data_class import PerCompoundDataset, custom_collate, build_val_dict_from_metas
 
 
-# --- add imports ---
 import argparse
 
 FEATURE_SETS = {
@@ -60,6 +54,9 @@ def parse_args():
     p.add_argument("--seed", type=int)
     p.add_argument("--loss_lambda", type=float)
     p.add_argument("--max_learning_rate", type=float)
+    p.add_argument("--pct_start", type=float)
+    p.add_argument("--initial_lr_ratio", type=float)
+    p.add_argument("--final_lr_ratio", type=float)
     p.add_argument("--dropout_rate", type=float)
     p.add_argument("--active_fraction", type=float)
     p.add_argument("--batch_size", type=int)
@@ -72,7 +69,13 @@ def parse_args():
     p.add_argument("--cls_hidden", type=int)
     p.add_argument("--regression_noise", type=float)
     p.add_argument("--feature_set", type=str, default="all")
-    
+    p.add_argument("--metas_path", type=str,
+                   default="/home/ethan2/GrowthNet/data/splits/Celine_v1/all_compound_metas.pkl")
+    p.add_argument("--train_smiles_path", type=str,
+                   default="/home/ethan2/GrowthNet/data/splits/Celine_v1/train_smiles.txt")
+    p.add_argument("--val_smiles_path", type=str,
+                   default="/home/ethan2/GrowthNet/data/splits/Celine_v1/val_smiles.txt")
+
     return vars(p.parse_args())
 
 # ─────────────────────────────────────────────────────────────
@@ -216,9 +219,7 @@ class MultiHeadLightning(pl.LightningModule):
     
 
 
-    def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        self._val_step_start = time.perf_counter()
-
+    def validation_step(self, batch, batch_idx):
         Xb, yb_reg, yb_cls = batch_to_tensor(batch, self.device, feature_set=self.hparams.feature_set)
         pred_reg, pred_cls_logits = self(Xb)
         pred_cls_probs = torch.sigmoid(pred_cls_logits)
@@ -227,203 +228,152 @@ class MultiHeadLightning(pl.LightningModule):
         cls_loss = self.bce_loss(pred_cls_logits.squeeze(-1), yb_cls)
         loss = reg_loss + cls_loss
 
-        # ─────────────────────────────────────────────
-        # Define all validation loader names in order
-        # ─────────────────────────────────────────────
-        names = [
-            "val_main",
-            "val_0_2",
-            "val_0_781",
-            "val_1_2",
-            "val_3_13",
-            "val_7_9",
-            "val_12_50",
-            "val_50"
-        ]
+        # Log val_main losses including actives/inactives split
+        active_mask   = (yb_cls == 1)
+        inactive_mask = ~active_mask
 
-        # ─────────────────────────────────────────────
-        # Log metrics
-        # ─────────────────────────────────────────────
-        if dataloader_idx == 0:
-            # Split regression losses by actives/inactives
-            active_mask = (yb_cls == 1)
-            inactive_mask = ~active_mask
+        reg_loss_act   = self.mse_loss(pred_reg[active_mask],   yb_reg[active_mask])   if active_mask.any()   else torch.tensor(0.0, device=self.device)
+        reg_loss_inact = self.mse_loss(pred_reg[inactive_mask], yb_reg[inactive_mask]) if inactive_mask.any() else torch.tensor(0.0, device=self.device)
 
-            if active_mask.any():
-                reg_loss_act = self.mse_loss(pred_reg[active_mask], yb_reg[active_mask])
-            else:
-                reg_loss_act = torch.tensor(0.0, device=self.device)
-            if inactive_mask.any():
-                reg_loss_inact = self.mse_loss(pred_reg[inactive_mask], yb_reg[inactive_mask])
-            else:
-                reg_loss_inact = torch.tensor(0.0, device=self.device)
+        self.log("val_main/reg_loss",          reg_loss,       on_epoch=True, sync_dist=False)
+        self.log("val_main/cls_loss",          cls_loss,       on_epoch=True, sync_dist=False)
+        self.log("val_main/loss",              loss,           on_epoch=True, sync_dist=False)
+        self.log("val_main/reg_loss_actives",  reg_loss_act,   on_epoch=True, sync_dist=False)
+        self.log("val_main/reg_loss_inactives",reg_loss_inact, on_epoch=True, sync_dist=False)
+        self.log("val_loss", loss, on_epoch=True, prog_bar=True, sync_dist=False)
 
-            self.log(f"{names[0]}/reg_loss", reg_loss, on_epoch=True, sync_dist=False)
-            self.log(f"{names[0]}/cls_loss", cls_loss, on_epoch=True, sync_dist=False)
-            self.log(f"{names[0]}/loss", loss, on_epoch=True, sync_dist=False)
-            self.log(f"{names[0]}/reg_loss_actives", reg_loss_act, on_epoch=True, sync_dist=False)
-            self.log(f"{names[0]}/reg_loss_inactives", reg_loss_inact, on_epoch=True, sync_dist=False)
-            self.log("val_loss", loss, on_epoch=True, prog_bar=True, sync_dist=False)
-        else:
-            self.log(f"{names[dataloader_idx]}/loss", loss, on_epoch=True, sync_dist=False)
-
-        # ─────────────────────────────────────────────
-        # Store per-(t,c) subgroup metrics
-        # ─────────────────────────────────────────────
-        name = names[dataloader_idx]
+        # Store per-(t,c) subgroup predictions for metric aggregation
         t = batch["t_raw"].detach()
         c = batch["c_raw"].detach()
 
         for ti, ci, r_pr, r_tr, c_pr, c_tr in zip(t, c, pred_reg, yb_reg, pred_cls_probs, yb_cls):
-            key = (dataloader_idx, round(ti.item(), 2), round(ci.item(), 3))
+            key = (round(ti.item(), 2), round(ci.item(), 3))
             g = self.val_outputs[key]
             g["r_pred"].append(r_pr.detach().cpu())
             g["r_true"].append(r_tr.detach().cpu())
             g["c_pred"].append(c_pr.detach().cpu())
             g["c_true"].append(c_tr.detach().cpu())
-            g["n"] += 1
-
-        elapsed = time.perf_counter() - self._val_step_start
-        print(f"validation_step took {elapsed:.4f}s (loader {dataloader_idx}, batch {batch_idx}, {name})")
 
         return loss
 
-    
     def on_validation_epoch_end(self):
-        
+        # Concentration slices: name → {conc, exclude_t0}
+        # val_main = all (t,c) cells
+        # val_<slice> = cells with c == slice_conc AND t != 0
+        SLICE_CONCS = {
+            "val_0_2":   0.2,
+            "val_0_781": 0.781,
+            "val_1_2":   1.2,
+            "val_3_13":  3.13,
+            "val_7_9":   7.9,
+            "val_12_50": 12.5,
+            "val_50":    50.0,
+        }
 
-        by_loader = defaultdict(list)
-
-        # Group results from all (t,c) subsets
-        for (loader_idx, t, c), g in self.val_outputs.items():
+        # Accumulate per-(t,c) metrics
+        subgroup_results = {}  # (t, c) → (mae, pearson, auc, ap, f1, rec)
+        for (t, c), g in self.val_outputs.items():
             r_pred = torch.stack(g["r_pred"])
             r_true = torch.stack(g["r_true"])
             c_pred = torch.stack(g["c_pred"])
             c_true = torch.stack(g["c_true"]).int()
 
-            # --- Actives mask for regression metrics ---
             active_mask = c_true == 1
-            if active_mask.any():
-                mae = mean_absolute_error(r_pred[active_mask], r_true[active_mask])
-                pearson = pearson_corrcoef(r_pred[active_mask], r_true[active_mask])
-            else:
-                mae = torch.tensor(0.0, device=r_pred.device)
-                pearson = torch.tensor(0.0, device=r_pred.device)
+            mae     = mean_absolute_error(r_pred[active_mask], r_true[active_mask]) if active_mask.any() else torch.tensor(0.0)
+            pearson = pearson_corrcoef(r_pred[active_mask], r_true[active_mask])    if active_mask.any() else torch.tensor(0.0)
+            auc = auroc(c_pred, c_true, task="binary")            if c_true.sum() > 0 else torch.tensor(0.0)
+            ap  = average_precision(c_pred, c_true, task="binary") if c_true.sum() > 0 else torch.tensor(0.0)
+            f1  = f1_score(c_pred > 0.5, c_true, task="binary")   if c_true.sum() > 0 else torch.tensor(0.0)
+            rec = recall(c_pred > 0.5, c_true, task="binary")     if c_true.sum() > 0 else torch.tensor(0.0)
+            subgroup_results[(t, c)] = (mae, pearson, auc, ap, f1, rec)
 
-            
-            auc = auroc(c_pred, c_true, task="binary") if c_true.sum() > 0 else torch.tensor(0.0)
-            ap = average_precision(c_pred, c_true, task="binary") if c_true.sum() > 0 else torch.tensor(0.0)
-            f1 = f1_score(c_pred > 0.5, c_true, task="binary") if c_true.sum() > 0 else torch.tensor(0.0)
-            rec = recall(c_pred > 0.5, c_true, task="binary") if c_true.sum() > 0 else torch.tensor(0.0)
+        def log_slice(name: str, rows):
+            if not rows:
+                return
+            n = len(rows)
+            mae_m  = sum(r[0] for r in rows) / n
+            pear_m = sum(r[1] for r in rows) / n
+            auc_m  = sum(r[2] for r in rows) / n
+            ap_m   = sum(r[3] for r in rows) / n
+            f1_m   = sum(r[4] for r in rows) / n
+            rec_m  = sum(r[5] for r in rows) / n
+            agg    = ap_m - 5 * mae_m + pear_m
 
-            # store per-subgroup results
-            by_loader[loader_idx].append((mae, pearson, auc, ap, f1, rec))
-        
-        names = [
-            "val_main",
-            "val_0_2",
-            "val_0_781",
-            "val_1_2",
-            "val_3_13",
-            "val_7_9",
-            "val_12_50",
-            "val_50"
-        ]
-        
-        
+            self.log(f"{name}/mae_active",      mae_m,  sync_dist=False)
+            self.log(f"{name}/pearson_active",  pear_m, sync_dist=False)
+            self.log(f"{name}/auc",             auc_m,  sync_dist=False)
+            self.log(f"{name}/ap",              ap_m,   sync_dist=False)
+            self.log(f"{name}/f1",              f1_m,   sync_dist=False)
+            self.log(f"{name}/recall",          rec_m,  sync_dist=False)
+            self.log(f"{name}/AP+Pearson-5*MAE", agg, prog_bar=(name == "val_main"), sync_dist=False)
 
-        
-        for idx, rows in by_loader.items():
-            
-            def mean_metric(i):
-                return sum(r[i] for r in rows) / len(rows)
-
-            mae_m  = mean_metric(0)
-            pear_m = mean_metric(1)
-            auc_m  = mean_metric(2)
-            ap_m  = mean_metric(3)
-            f1_m   = mean_metric(4)
-            rec_m  = mean_metric(5)
-
-            
-            agg = ap_m-5*mae_m + pear_m
-
-            # Log everything
-            self.log(f"{names[idx]}/mae_active", mae_m, sync_dist=False)
-            self.log(f"{names[idx]}/pearson_active", pear_m, sync_dist=False)
-            self.log(f"{names[idx]}/auc", auc_m, sync_dist=False)
-            self.log(f"{names[idx]}/ap", ap_m, sync_dist=False)
-            self.log(f"{names[idx]}/f1", f1_m, sync_dist=False)
-            self.log(f"{names[idx]}/recall", rec_m, sync_dist=False)
-            self.log(f"{names[idx]}/AP+Pearson-5*MAE", agg,
-                    prog_bar=True, sync_dist=False)
-
-            # Track best agg on val_main
-            if idx == 0:
+            if name == "val_main":
                 if agg > getattr(self, "best_val_main_agg", float("-inf")):
-                    self.best_val_main_agg = agg
-                    self.best_val_main_epoch = self.current_epoch  # record epoch
-                self.log("val_main/best_agg_metric", self.best_val_main_agg,
-                        prog_bar=True, sync_dist=False)
-                self.log("val_main/best_agg_epoch", getattr(self, "best_val_main_epoch", -1),
-                        prog_bar=False, sync_dist=False)
+                    self.best_val_main_agg   = agg
+                    self.best_val_main_epoch = self.current_epoch
+                self.log("val_main/best_agg_metric", self.best_val_main_agg, prog_bar=True,  sync_dist=False)
+                self.log("val_main/best_agg_epoch",  getattr(self, "best_val_main_epoch", -1), prog_bar=False, sync_dist=False)
+
+        # val_main: all subgroups
+        log_slice("val_main", list(subgroup_results.values()))
+
+        # per-concentration slices: c matches AND t != 0
+        for slice_name, conc in SLICE_CONCS.items():
+            rows = [
+                metrics
+                for (t, c), metrics in subgroup_results.items()
+                if abs(c - conc) < 0.001 and t != 0.0
+            ]
+            log_slice(slice_name, rows)
 
         self.val_outputs.clear()
             
 
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(
+        max_lr = self.hparams.max_learning_rate
+        div_factor = 1.0 / self.hparams.initial_lr_ratio
+        final_div_factor = self.hparams.initial_lr_ratio / self.hparams.final_lr_ratio
+        optimizer = torch.optim.AdamW(
             self.parameters(),
-            lr=self.hparams.max_learning_rate,
-            weight_decay=self.hparams.weight_decay
+            lr=max_lr * self.hparams.initial_lr_ratio,
+            weight_decay=self.hparams.weight_decay,
         )
-        scheduler = CosineAnnealingLR(
+        scheduler = OneCycleLR(
             optimizer,
-            T_max=self.hparams.epochs,
-            eta_min=1e-8,
+            max_lr=max_lr,
+            total_steps=self.trainer.estimated_stepping_batches,
+            pct_start=self.hparams.pct_start,
+            anneal_strategy='cos',
+            div_factor=div_factor,
+            final_div_factor=final_div_factor,
         )
-        return {"optimizer": optimizer, "lr_scheduler": scheduler}
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+            },
+        }
 
 
 # ─────────────────────────────────────────────────────────────
 # DATAMODULE
 # ─────────────────────────────────────────────────────────────
 class GrowthNetDataModule(pl.LightningDataModule):
-    def __init__(self, config, df_train, dict_val_main, 
-                 dict_val_0_2,
-                 dict_val_0_781,
-                 dict_val_1_2,
-                 dict_val_3_13,
-                 dict_val_7_9,
-                 dict_val_12_50,
-                 dict_val_50
-                ):
+    def __init__(self, config, dict_val_main):
         super().__init__()
         self.config = config
-        self.df_train = df_train
         self.dict_val_main = dict_val_main
-        self.dict_val_0_2 = dict_val_0_2
-        self.dict_val_0_781 = dict_val_0_781
-        self.dict_val_1_2 = dict_val_1_2
-        self.dict_val_3_13 = dict_val_3_13
-        self.dict_val_7_9 = dict_val_7_9
-        self.dict_val_12_50 = dict_val_12_50
-        self.dict_val_50 = dict_val_50
-
-
-    def setup(self, stage=None):
-        #self.train_ds = PerCompoundDataset(
-        #    self.df_train, k=self.config['samples'], seed=None, num_fourier=3
-        #)
-        pass
 
     def train_dataloader(self):
 
         epoch = getattr(self.trainer, "current_epoch", 0)
 
         self.train_ds = PerCompoundDataset(
-           self.df_train, k=self.config['samples'], seed=self.config['seed']+ epoch, num_fourier=3, noise=self.config['regression_noise']
+            self.config['metas_path'],
+            self.config['train_smiles_path'],
+            k=self.config['samples'], seed=self.config['seed'] + epoch, num_fourier=3, noise=self.config['regression_noise']
         )
 
         
@@ -457,16 +407,7 @@ class GrowthNetDataModule(pl.LightningDataModule):
 
         identity = lambda batch: batch[0]  # don’t stack into a batch
 
-        return [
-            DataLoader(DictDataset(self.dict_val_main),  batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True),
-            DataLoader(DictDataset(self.dict_val_0_2),   batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True),
-            DataLoader(DictDataset(self.dict_val_0_781), batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True),
-            DataLoader(DictDataset(self.dict_val_1_2),   batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True),
-            DataLoader(DictDataset(self.dict_val_3_13),  batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True),
-            DataLoader(DictDataset(self.dict_val_7_9),   batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True),
-            DataLoader(DictDataset(self.dict_val_12_50), batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True),
-            DataLoader(DictDataset(self.dict_val_50),    batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True)
-        ]
+        return DataLoader(DictDataset(self.dict_val_main), batch_size=1, collate_fn=identity, num_workers=0, pin_memory=True)
     
 
 
@@ -496,60 +437,28 @@ def main():
     except Exception:
         pass
 
-    # ── Load data ──
-    df_train = pd.read_pickle("/home/ethan2/GrowthNet/data/train/df_well_train_Celine_clusters_mad_4.pkl")
+    # ── Load unified data ──
+    print(f"[sweep_multihead] Loading metas from {config['metas_path']}")
+    with open(config['metas_path'], "rb") as f:
+        all_metas = pickle.load(f)
 
-    with open("/home/ethan2/GrowthNet/data/test/dict_val_fourier_k_3_Celine.pkl", "rb") as f:
-        dict_test = pickle.load(f)
+    val_smiles = set(open(config['val_smiles_path']).read().splitlines())
+    val_metas  = [m for m in all_metas if m.smiles in val_smiles]
+    print(f"[sweep_multihead] Building val dict from {len(val_metas)} val compounds...")
+    dict_val_main = build_val_dict_from_metas(val_metas)
 
-    with open("/home/ethan2/GrowthNet/data/test/dict_val_fourier_k_3_conc_0_2_Celine.pkl", "rb") as f:
-        dict_test_conc_0_2 = pickle.load(f)
-    
-
-    with open("/home/ethan2/GrowthNet/data/test/dict_val_fourier_k_3_conc_0_781_Celine.pkl", "rb") as f:
-        dict_test_conc_0_781 = pickle.load(f)
-
-    with open("/home/ethan2/GrowthNet/data/test/dict_val_fourier_k_3_conc_1_2_Celine.pkl", "rb") as f:
-        dict_test_conc_1_2 = pickle.load(f)
-
-    with open("/home/ethan2/GrowthNet/data/test/dict_val_fourier_k_3_conc_3_13_Celine.pkl", "rb") as f:
-        dict_test_conc_3_13 = pickle.load(f)
-
-    with open("/home/ethan2/GrowthNet/data/test/dict_val_fourier_k_3_conc_7_9_Celine.pkl", "rb") as f:
-        dict_test_conc_7_9 = pickle.load(f)
-
-    with open("/home/ethan2/GrowthNet/data/test/dict_val_fourier_k_3_conc_12_50_Celine.pkl", "rb") as f:
-        dict_test_conc_12_50 = pickle.load(f)
-
-    with open("/home/ethan2/GrowthNet/data/test/dict_val_fourier_k_3_conc_50_Celine.pkl", "rb") as f:
-        dict_test_conc_50 = pickle.load(f)
-
-    # Infer input_dim from one prepared batch
-    Xte, _, _ = batch_to_tensor(dict_test, torch.device("cpu"), feature_set=config['feature_set'])
+    # Infer input_dim from val dict
+    Xte, _, _ = batch_to_tensor(dict_val_main, torch.device("cpu"), feature_set=config['feature_set'])
 
     # DataModule & Model
-    dm = GrowthNetDataModule(
-        config,
-        df_train,
-        dict_test,
-        dict_test_conc_0_2,
-        dict_test_conc_0_781,
-        dict_test_conc_1_2,
-        dict_test_conc_3_13,
-        dict_test_conc_7_9,
-        dict_test_conc_12_50,
-        dict_test_conc_50
-    )
+    dm = GrowthNetDataModule(config, dict_val_main)
     model = MultiHeadLightning(input_dim=Xte.shape[1], config=config)
 
-    # Logger only on rank 0 (rank guard should be defined elsewhere)
     wandb_logger = WandbLogger()
-    if wandb_logger is not None:
-        # record sweep config on the run
-        try:
-            wandb_logger.experiment.config.update(config, allow_val_change=True)
-        except Exception:
-            pass
+    try:
+        wandb_logger.experiment.config.update(config, allow_val_change=True)
+    except Exception:
+        pass
     
     run_id = wandb.run.id if wandb.run else "debug"
 
@@ -580,25 +489,14 @@ def main():
     # Train
     trainer.fit(model, datamodule=dm)
 
-    # ── Save hparams.json alongside best.ckpt ──
-    import json
     with open(os.path.join(save_dir, "hparams.json"), "w") as f:
         json.dump(config, f, indent=2)
 
-    # Log local path of best checkpoint to wandb (for traceability)
     best_ckpt = checkpoint_cb.best_model_path
     if best_ckpt:
         wandb.log({"best_checkpoint_path": best_ckpt})
         print(f"Best checkpoint saved at: {best_ckpt}")
         print(f"Hparams saved at: {os.path.join(save_dir, 'hparams.json')}")
-
-
-
-
-    best_ckpt = checkpoint_cb.best_model_path
-    if best_ckpt:
-        wandb.log({"best_checkpoint_path": best_ckpt})
-        print(f"Best checkpoint saved at: {best_ckpt}")
 
 
     

@@ -1,8 +1,7 @@
 from __future__ import annotations
-import math, re
+import math
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Optional, Tuple, List, Sequence
-from typing import Literal
+from typing import Any, Dict, Optional, List
 import numpy as np
 import pandas as pd
 import torch
@@ -33,67 +32,52 @@ class PerCompoundDataset(Dataset):
     """
     Returns one item per compound containing k sampled (t,c) with:
       - y_reg: interpolated OD (regression target)
-      - y_cls: interpolated classification target (placeholder for now)
+      - y_cls: interpolated classification target
       - features_by_family: dict {family: fingerprint tensor}
 
     If a compound has >1 concentration → local RectBivariateSpline in (time, log(conc)).
-    If only one concentration → calls placeholder _interpolate_regression_single_conc().
-    Classification interpolation is also a placeholder: _interpolate_classification().
+    If only one concentration → calls _interpolate_single_conc().
 
     Output dict keys:
       {
         'compound', 'smiles', 'single_conc',
         't': FloatTensor[k], 'c': FloatTensor[k],
-        'y_reg': FloatTensor[k], 'y_cls': FloatTensor[k],   # y_cls presently NaN
+        'y_reg': FloatTensor[k], 'y_cls': FloatTensor[k],
         'features_by_family': dict[str, FloatTensor]
       }
     """
 
     def __init__(
         self,
-        df: pd.DataFrame,
+        metas_path: str,
+        smiles_list_path: str,
         *,
-        k: int, 
+        k: int,
         seed: Optional[int] = None,
         num_fourier: int,
-        noise:float,
-        compounds: Optional[Iterable[str]] = None, #if wanted to only train on these compounds
+        noise: float,
     ):
-        
-        self.df = df.copy()
-
-        self.max_time = self.df['Timepoint'].max()
-
         self.num_fourier = int(num_fourier)
         self.k = int(k)
         self.rbs_reg = {'kx': 1, 'ky': 1, 's': 0.0}
         self.kx = int(self.rbs_reg.get('kx'))
         self.ky = int(self.rbs_reg.get('ky'))
-        self.noise=noise
-
+        self.noise = noise
 
         self.rng = np.random.default_rng(seed)
 
-        #needed = {'Compound', 'Smiles', 'Timepoint', 'Concentration', 'OD', 'is_Active'}
+        split_smiles = set(open(smiles_list_path).read().splitlines())
 
-        self.fp_cols_by_family: List[str] = sorted(self._collect_fp_groups(self.df)) #dict of col names for each fp ['ecfp_fp', 'maccs_fp', 'rdkit_fp']
+        with open(metas_path, "rb") as f:
+            all_metas: List[CompoundMeta] = pickle.load(f)
 
-        if compounds is not None:
-            keep = set(compounds)
-            self.df = self.df[self.df['Compound'].isin(keep)].reset_index(drop=True) 
-            
-        # Build per-compound metadata
-        self._metas: List[CompoundMeta] = []
-
-
-        with open("/home/ethan2/GrowthNet/data/train/Celine_CompoundMetas_list.pkl", "rb") as f:
-            saved_metas=pickle.load(f)
-
-
-        self._metas=saved_metas
+        self._metas: List[CompoundMeta] = [m for m in all_metas if m.smiles in split_smiles]
 
         if not self._metas:
-            raise ValueError("No compounds available after filtering.")
+            raise ValueError(
+                f"No compounds matched the SMILES list in {smiles_list_path!r}. "
+                f"Check that the SMILES in the list match the canonical SMILES in {metas_path!r}."
+            )
 
     def __len__(self) -> int:
         return len(self._metas)
@@ -167,20 +151,6 @@ class PerCompoundDataset(Dataset):
             'y_cls': torch.from_numpy(y_cls),          
             'features_by_family': features_by_family,  
         }
-    
-    def _collect_fp_groups(
-        self,
-        df: pd.DataFrame,
-        FP_REGEX=re.compile(r"^(.+?)_fp"),  # e.g., ["rdkit", "maccs"]
-    ) -> List[str]:
-
-        groups: List[str] = []
-        for col in df.columns:
-            m = FP_REGEX.match(col)
-            if not m:
-                continue
-            groups.append(col)
-        return groups
     
     def _interpolate_single_conc(
         self,
@@ -407,6 +377,65 @@ class ExplicitDataset(Dataset):
             "y_cls": torch.tensor(label, dtype=torch.float32),
             "features_by_family": features_by_family,
         }
+
+def build_val_dict_from_metas(metas: List[CompoundMeta], num_fourier: int = 3) -> dict:
+    """
+    Build a validation dict from a list of CompoundMeta objects.
+
+    Flattens each meta's pivot_od / pivot_cls into observed (t, c, OD, is_Active)
+    rows, computes Fourier time encodings, and stacks fingerprints — producing the
+    same dict format as the precomputed val pickles.  Rows are ordered by
+    (compound, Timepoint, Concentration) for deterministic output.
+
+    Returns a dict with keys:
+        compound, smiles, t_raw, t_fourier, c_raw, c_log, y_reg, y_cls,
+        features_by_family
+    """
+    compounds, smiles_list = [], []
+    t_raw_list, c_raw_list, y_reg_list, y_cls_list = [], [], [], []
+    fps_acc: Dict[str, list] = {fam: [] for fam in sorted(metas[0].fps_by_family.keys())}
+
+    for meta in sorted(metas, key=lambda m: m.compound):
+        for t_idx in sorted(meta.pivot_od.index):
+            for c_idx in sorted(meta.pivot_od.columns):
+                od  = meta.pivot_od.loc[t_idx, c_idx]
+                cls = meta.pivot_cls.loc[t_idx, c_idx]
+                if pd.isna(od) or pd.isna(cls):
+                    continue
+                compounds.append(meta.compound)
+                smiles_list.append(meta.smiles)
+                t_raw_list.append(float(t_idx))
+                c_raw_list.append(float(c_idx))
+                y_reg_list.append(float(od))
+                y_cls_list.append(float(cls))
+                for fam in fps_acc:
+                    fps_acc[fam].append(meta.fps_by_family[fam])
+
+    t_raw = np.array(t_raw_list, dtype=np.float32)
+    c_raw = np.array(c_raw_list, dtype=np.float32)
+
+    T = 15.0
+    t_enc = np.zeros((len(t_raw), 2 * num_fourier), dtype=np.float32)
+    for j, k_freq in enumerate(range(1, num_fourier + 1)):
+        angle = 2 * np.pi * k_freq * (t_raw - 1.0) / T
+        t_enc[:, 2*j]   = np.sin(angle)
+        t_enc[:, 2*j+1] = np.cos(angle)
+
+    return {
+        "compound":   compounds,
+        "smiles":     smiles_list,
+        "t_raw":      torch.from_numpy(t_raw),
+        "t_fourier":  torch.from_numpy(t_enc),
+        "c_raw":      torch.from_numpy(c_raw),
+        "c_log":      torch.from_numpy(np.log(c_raw)),
+        "y_reg":      torch.from_numpy(np.array(y_reg_list, dtype=np.float32)),
+        "y_cls":      torch.from_numpy(np.array(y_cls_list, dtype=np.float32)),
+        "features_by_family": {
+            fam: torch.from_numpy(np.stack(vecs))
+            for fam, vecs in fps_acc.items()
+        },
+    }
+
 
 def custom_collate(batch):
         """

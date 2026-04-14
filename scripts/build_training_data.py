@@ -1,17 +1,17 @@
 #!/usr/bin/env python
 """
-Rebuild CompoundMetas and validation dicts with canonical SMILES and all
-feature families from smiles_representations.pkl.
+Build the unified data artifact and SMILES split files for a given split.
 
-Outputs:
-  - data/train/Celine_CompoundMetas_list.pkl   (list of CompoundMeta)
-  - data/test/dict_val_fourier_k_3_Celine.pkl  (full val dict)
-  - data/test/dict_val_fourier_k_3_conc_*_Celine.pkl  (7 per-concentration val dicts)
+Outputs (under data/splits/<split_name>/):
+  - all_compound_metas.pkl   list[CompoundMeta] for ALL compounds (train + val)
+  - train_smiles.txt         canonical SMILES for train compounds (one per line)
+  - val_smiles.txt           canonical SMILES for val compounds (one per line)
 
 Usage:
-  python build_training_data.py
+  python build_training_data.py [--split Celine_v1]
 """
 
+import argparse
 import os
 import pickle
 import sys
@@ -30,11 +30,8 @@ sys.path.insert(0, str(PROJ / "sweeps"))
 from data_class import CompoundMeta, ExplicitDataset, custom_collate
 
 TRAIN_DF_PATH = PROJ / "data/train/df_well_train_Celine_clusters_mad_4.pkl"
-VAL_DF_PATH = PROJ / "data/validation/df_well_validation_Celine_clusters_mad_4.pkl"
+VAL_DF_PATH   = PROJ / "data/validation/df_well_validation_Celine_clusters_mad_4.pkl"
 REP_DICT_PATH = PROJ / "data/smiles_representations.pkl"
-
-METAS_OUT = PROJ / "data/train/Celine_CompoundMetas_list.pkl"
-VAL_OUT_DIR = PROJ / "data/test"
 
 NUM_FOURIER = 3
 
@@ -46,31 +43,35 @@ def canonicalize(smi: str) -> str:
     return Chem.MolToSmiles(mol)
 
 
-def replace_features(val_dict: dict, rep_dict: dict) -> dict:
-    """Replace features_by_family in a collated val dict with rep_dict lookups."""
-    new_features: Dict[str, list] = {}
-    for smi in val_dict["smiles"]:
-        canon = canonicalize(smi)
-        rep = rep_dict[canon]
-        for fam, vec in sorted(rep.items()):
-            new_features.setdefault(fam, []).append(
-                torch.from_numpy(vec.astype(np.float32))
-            )
-    val_dict["features_by_family"] = {
-        fam: torch.stack(vecs) for fam, vecs in sorted(new_features.items())
-    }
-    return val_dict
+def build_recanon_lookup(rep_dict: dict) -> dict:
+    """Map current-RDKit canonical SMILES → rep_dict key (handles version drift)."""
+    lookup = {}
+    for old_key in rep_dict:
+        new_key = canonicalize(old_key)
+        if new_key is not None:
+            lookup[new_key] = old_key
+    return lookup
 
 
-def build_compound_metas(df_train: pd.DataFrame, rep_dict: dict) -> list:
-    """Build a list of CompoundMeta objects with canonical SMILES and full features."""
+def lookup_rep(canon_smi: str, rep_dict: dict, recanon: dict) -> Dict:
+    """Look up fingerprints; fall back to re-canonicalized key on version drift."""
+    if canon_smi in rep_dict:
+        return rep_dict[canon_smi]
+    old_key = recanon.get(canon_smi)
+    if old_key is not None:
+        return rep_dict[old_key]
+    raise KeyError(f"SMILES not in rep_dict (tried direct + recanon): {canon_smi!r}")
+
+
+def build_compound_metas(df: pd.DataFrame, rep_dict: dict, recanon: dict, label: str) -> list:
+    """Build CompoundMeta objects from a DataFrame (train or val)."""
     metas = []
-    grouped = df_train.groupby("Compound", sort=True)
+    grouped = df.groupby("Compound", sort=True)
     total = len(grouped)
 
     for i, (comp, sub) in enumerate(grouped):
-        if (i + 1) % 5000 == 0 or i == 0:
-            print(f"  CompoundMeta {i + 1}/{total}...")
+        if (i + 1) % 500 == 0 or i == 0:
+            print(f"  [{label}] CompoundMeta {i + 1}/{total}...")
 
         sub = sub.sort_values(["Timepoint", "Concentration"])
 
@@ -91,7 +92,7 @@ def build_compound_metas(df_train: pd.DataFrame, rep_dict: dict) -> list:
         raw_smiles = str(sub["Smiles"].iloc[0])
         canon_smi = canonicalize(raw_smiles)
 
-        rep = rep_dict[canon_smi]
+        rep = lookup_rep(canon_smi, rep_dict, recanon)
         fps_by_family: Dict[str, np.ndarray] = {
             fam: vec.astype(np.float32) for fam, vec in sorted(rep.items())
         }
@@ -126,74 +127,76 @@ def build_compound_metas(df_train: pd.DataFrame, rep_dict: dict) -> list:
     return metas
 
 
-def build_val_dict(df: pd.DataFrame, rep_dict: dict) -> dict:
-    """Build a single collated val dict and replace features from rep_dict."""
-    ds = ExplicitDataset(df, num_fourier=NUM_FOURIER)
-    loader = DataLoader(ds, batch_size=len(ds), collate_fn=custom_collate)
-    val_dict = next(iter(loader))
-    return replace_features(val_dict, rep_dict)
-
-
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--split", default="Celine_v1",
+                        help="Name of the split directory under data/splits/")
+    args = parser.parse_args()
+
+    out_dir = PROJ / "data" / "splits" / args.split
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     print("Loading DataFrames...")
     df_train = pd.read_pickle(TRAIN_DF_PATH)
-    df_val = pd.read_pickle(VAL_DF_PATH)
+    df_val   = pd.read_pickle(VAL_DF_PATH)
+    print(f"  Train rows: {len(df_train):,}  Val rows: {len(df_val):,}")
 
     print(f"Loading representations from {REP_DICT_PATH}...")
     with open(REP_DICT_PATH, "rb") as f:
         rep_dict = pickle.load(f)
-    print(f"  {len(rep_dict)} entries loaded.")
+    print(f"  {len(rep_dict):,} entries loaded.")
 
-    # ── Build CompoundMetas ──────────────────────────────────────────
-    print("\nBuilding CompoundMetas...")
-    metas = build_compound_metas(df_train, rep_dict)
-    print(f"  {len(metas)} CompoundMeta objects created.")
+    print("  Building re-canonicalization lookup (handles RDKit version drift)...")
+    recanon = build_recanon_lookup(rep_dict)
 
-    METAS_OUT.parent.mkdir(parents=True, exist_ok=True)
-    with open(METAS_OUT, "wb") as f:
-        pickle.dump(metas, f)
-    print(f"  Saved to {METAS_OUT}")
+    # ── Train CompoundMetas ─────────────────────────────────────
+    print("\nBuilding train CompoundMetas...")
+    train_metas = build_compound_metas(df_train, rep_dict, recanon, label="train")
+    train_smiles = [m.smiles for m in train_metas]
+    print(f"  {len(train_metas)} train compounds.")
 
-    # ── Build full validation dict ───────────────────────────────────
-    print("\nBuilding full validation dict...")
-    val_main = build_val_dict(df_val, rep_dict)
-    out_path = VAL_OUT_DIR / "dict_val_fourier_k_3_Celine.pkl"
-    with open(out_path, "wb") as f:
-        pickle.dump(val_main, f)
-    print(f"  Saved to {out_path}  ({len(val_main['smiles'])} rows)")
+    # ── Val CompoundMetas ───────────────────────────────────────
+    print("\nBuilding val CompoundMetas...")
+    val_metas = build_compound_metas(df_val, rep_dict, recanon, label="val")
+    val_smiles = [m.smiles for m in val_metas]
+    print(f"  {len(val_metas)} val compounds.")
 
-    # ── Build per-concentration validation dicts ─────────────────────
-    conc_specs = [
-        (0.2, "0_2"),
-        (0.781, "0_781"),
-        (1.2, "1_2"),
-        (3.13, "3_13"),
-        (7.9, "7_9"),
-        (12.5, "12_50"),
-        (50, "50"),
-    ]
+    # ── Sanity: no overlap ──────────────────────────────────────
+    train_set = set(train_smiles)
+    val_set   = set(val_smiles)
+    overlap = train_set & val_set
+    if overlap:
+        raise ValueError(
+            f"Train/val SMILES overlap detected ({len(overlap)} compounds)!\n"
+            f"First 5: {list(overlap)[:5]}"
+        )
+    print(f"\nSanity check passed: train and val SMILES are disjoint.")
 
-    for conc, text in conc_specs:
-        print(f"  Building val dict for conc={conc}...")
-        df_subset = df_val[
-            (df_val["Concentration"] == conc) & (df_val["Timepoint"] != 0)
-        ].reset_index(drop=True)
-        if len(df_subset) == 0:
-            print(f"    WARNING: no rows for concentration {conc}, skipping.")
-            continue
-        val_conc = build_val_dict(df_subset, rep_dict)
-        out_path = VAL_OUT_DIR / f"dict_val_fourier_k_3_conc_{text}_Celine.pkl"
-        with open(out_path, "wb") as f:
-            pickle.dump(val_conc, f)
-        print(f"    Saved ({len(val_conc['smiles'])} rows)")
+    # ── Write SMILES lists ──────────────────────────────────────
+    train_smiles_path = out_dir / "train_smiles.txt"
+    val_smiles_path   = out_dir / "val_smiles.txt"
 
-    # ── Summary ──────────────────────────────────────────────────────
-    sample = metas[0]
+    with open(train_smiles_path, "w") as f:
+        f.write("\n".join(train_smiles))
+    print(f"  Saved {len(train_smiles)} train SMILES → {train_smiles_path}")
+
+    with open(val_smiles_path, "w") as f:
+        f.write("\n".join(val_smiles))
+    print(f"  Saved {len(val_smiles)} val SMILES → {val_smiles_path}")
+
+    # ── Unified pickle ──────────────────────────────────────────
+    all_metas = train_metas + val_metas
+    out_pkl = out_dir / "all_compound_metas.pkl"
+    with open(out_pkl, "wb") as f:
+        pickle.dump(all_metas, f)
+    print(f"\n  Saved {len(all_metas)} CompoundMeta objects → {out_pkl}")
+
+    # ── Summary ─────────────────────────────────────────────────
+    sample = train_metas[0]
     fam_dims = {k: v.shape[0] for k, v in sample.fps_by_family.items()}
-    total_fp = sum(fam_dims.values())
-    print(f"\nFeature families per compound: {fam_dims}")
-    print(f"Total fingerprint dim: {total_fp}")
-    print(f"Total input dim (with fourier+conc): {total_fp + 2 * NUM_FOURIER + 2}")
+    print(f"\nFeature families: {fam_dims}")
+    print(f"Total fp dim: {sum(fam_dims.values())}")
+    print(f"Total input dim (fourier+conc+fps): {sum(fam_dims.values()) + 2 * NUM_FOURIER + 2}")
     print("\nDone.")
 
 
