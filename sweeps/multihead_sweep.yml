@@ -20,8 +20,8 @@ parameters:
 
   weight_decay:
     distribution: log_uniform_values
-    min: 0.00005
-    max: 0.001
+    min: 0.0001
+    max: 0.1
 
   seed:
     values: [42]
@@ -34,27 +34,12 @@ parameters:
   max_learning_rate:
     distribution: log_uniform_values
     min: 0.001
-    max: 0.05
-
-  pct_start:
-    distribution: uniform
-    min: 0.05
-    max: 0.4
-
-  initial_lr_ratio:
-    distribution: uniform
-    min: 0.02
-    max: 0.1
-
-  final_lr_ratio:
-    distribution: log_uniform_values
-    min: 1.0e-5
-    max: 1.0e-3
+    max: 0.01
 
   dropout_rate:
     distribution: uniform
     min: 0.10
-    max: 0.25
+    max: 0.30
 
   active_fraction:
     distribution: uniform
@@ -77,7 +62,7 @@ parameters:
   trunk_dim:
     distribution: q_log_uniform_values
     min: 450
-    max: 600
+    max: 700
 
   reg_layers:
     values: [2,3,4]

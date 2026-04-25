@@ -1,0 +1,27 @@
+Metadata-Version: 2.4
+Name: growthnet
+Version: 0.1.0
+Summary: Multi-task neural network for molecular property prediction (optical density growth curves and compound activity)
+Author: Ethan
+Requires-Python: >=3.9
+Requires-Dist: numpy
+Requires-Dist: pandas
+Requires-Dist: torch>=2.0
+Requires-Dist: pytorch-lightning>=2.0
+Requires-Dist: torchmetrics>=0.11
+Requires-Dist: wandb>=0.13
+Requires-Dist: scikit-learn
+Requires-Dist: scipy
+Requires-Dist: rdkit
+Requires-Dist: datamol
+Requires-Dist: pyyaml
+Requires-Dist: accelerate
+Requires-Dist: tqdm
+Requires-Dist: matplotlib
+Requires-Dist: seaborn
+Requires-Dist: anndata>=0.10.9
+Requires-Dist: scanpy>=1.10.3
+Requires-Dist: leidenalg>=0.11.0
+Provides-Extra: dev
+Requires-Dist: jupyter; extra == "dev"
+Requires-Dist: ipython; extra == "dev"

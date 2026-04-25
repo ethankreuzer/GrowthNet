@@ -1,0 +1,7 @@
+README.md
+pyproject.toml
+growthnet.egg-info/PKG-INFO
+growthnet.egg-info/SOURCES.txt
+growthnet.egg-info/dependency_links.txt
+growthnet.egg-info/requires.txt
+growthnet.egg-info/top_level.txt

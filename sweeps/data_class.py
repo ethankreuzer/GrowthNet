@@ -14,6 +14,7 @@ import pickle
 class CompoundMeta:
     compound: str
     smiles: str
+    scaffold: str                     # Murko scaffold SMILES
     pivot_od: pd.DataFrame            # index: Timepoint, columns: Concentration → OD
     pivot_cls: pd.DataFrame           # same axes → is_Active
     t_vals: np.ndarray                # sorted unique timepoints (float)
@@ -56,6 +57,7 @@ class PerCompoundDataset(Dataset):
         seed: Optional[int] = None,
         num_fourier: int,
         noise: float,
+        required_families: Optional[set] = None,
     ):
         self.num_fourier = int(num_fourier)
         self.k = int(k)
@@ -71,7 +73,11 @@ class PerCompoundDataset(Dataset):
         with open(metas_path, "rb") as f:
             all_metas: List[CompoundMeta] = pickle.load(f)
 
-        self._metas: List[CompoundMeta] = [m for m in all_metas if m.smiles in split_smiles]
+        self._metas: List[CompoundMeta] = [
+            m for m in all_metas
+            if m.smiles in split_smiles
+            and (required_families is None or required_families.issubset(m.fps_by_family.keys()))
+        ]
 
         if not self._metas:
             raise ValueError(
@@ -393,7 +399,12 @@ def build_val_dict_from_metas(metas: List[CompoundMeta], num_fourier: int = 3) -
     """
     compounds, smiles_list = [], []
     t_raw_list, c_raw_list, y_reg_list, y_cls_list = [], [], [], []
-    fps_acc: Dict[str, list] = {fam: [] for fam in sorted(metas[0].fps_by_family.keys())}
+    # Use the intersection of fingerprint families present in every meta so that
+    # metas lacking a family (e.g. boltz2_rep not computed yet) don't cause KeyErrors.
+    common_fams = set(metas[0].fps_by_family.keys())
+    for meta in metas[1:]:
+        common_fams &= set(meta.fps_by_family.keys())
+    fps_acc: Dict[str, list] = {fam: [] for fam in sorted(common_fams)}
 
     for meta in sorted(metas, key=lambda m: m.compound):
         for t_idx in sorted(meta.pivot_od.index):

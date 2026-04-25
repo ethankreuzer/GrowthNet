@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader, WeightedRandomSampler
-from torch.optim.lr_scheduler import OneCycleLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from pytorch_lightning.loggers import WandbLogger
 from collections import defaultdict
 from pytorch_lightning.callbacks import ModelCheckpoint
@@ -54,9 +54,7 @@ def parse_args():
     p.add_argument("--seed", type=int)
     p.add_argument("--loss_lambda", type=float)
     p.add_argument("--max_learning_rate", type=float)
-    p.add_argument("--pct_start", type=float)
-    p.add_argument("--initial_lr_ratio", type=float)
-    p.add_argument("--final_lr_ratio", type=float)
+    p.add_argument("--eta_min", type=float, default=1e-8)
     p.add_argument("--dropout_rate", type=float)
     p.add_argument("--active_fraction", type=float)
     p.add_argument("--batch_size", type=int)
@@ -70,11 +68,13 @@ def parse_args():
     p.add_argument("--regression_noise", type=float)
     p.add_argument("--feature_set", type=str, default="all")
     p.add_argument("--metas_path", type=str,
-                   default="/home/ethan2/GrowthNet/data/splits/Celine_v1/all_compound_metas.pkl")
+                   default="/home/ethan2/GrowthNet/data/splits/my_split_v1/all_compound_metas.pkl")
     p.add_argument("--train_smiles_path", type=str,
-                   default="/home/ethan2/GrowthNet/data/splits/Celine_v1/train_smiles.txt")
+                   default="/home/ethan2/GrowthNet/data/splits/my_split_v1/smiles_splits/train.txt")
     p.add_argument("--val_smiles_path", type=str,
-                   default="/home/ethan2/GrowthNet/data/splits/Celine_v1/val_smiles.txt")
+                   default="/home/ethan2/GrowthNet/data/splits/my_split_v1/smiles_splits/val.txt")
+    p.add_argument("--test_smiles_path", type=str,
+                   default="/home/ethan2/GrowthNet/data/splits/my_split_v1/smiles_splits/test.txt")
 
     return vars(p.parse_args())
 
@@ -177,7 +177,7 @@ def batch_to_tensor(batch: dict, device: torch.device, feature_set: str = "all")
 # LIGHTNING MODULE
 # ─────────────────────────────────────────────────────────────
 class MultiHeadLightning(pl.LightningModule):
-    def __init__(self, input_dim, config):
+    def __init__(self, input_dim, config, dict_test_main):
         super().__init__()
         self.save_hyperparameters(config)
         self.model = MultiHeadNet(
@@ -192,16 +192,52 @@ class MultiHeadLightning(pl.LightningModule):
         )
         self.mse_loss = nn.MSELoss()
         self.bce_loss = nn.BCEWithLogitsLoss()
-        
+
         self.val_outputs = defaultdict(lambda: {
             "r_pred": [], "r_true": [], "c_pred": [], "c_true": [], "n": 0
         })
-        self.best_val_main_agg = float("-inf")
+        self.best_val_main_agg  = float("-inf")
+        self.best_test_main_agg = float("-inf")
+        self.dict_test_main = dict_test_main
 
 
 
     def forward(self, x):
         return self.model(x)
+
+    @torch.no_grad()
+    def _eval_agg_on_dict(self, data_dict: dict) -> float:
+        """Compute mean(AP + Pearson - 5*MAE) over per-(t,c) subgroups for a pre-built dict."""
+        self.model.eval()
+        Xb, yb_reg, yb_cls = batch_to_tensor(data_dict, self.device, feature_set=self.hparams.feature_set)
+        pred_reg, pred_cls_logits = self.model(Xb)
+        pred_cls_probs = torch.sigmoid(pred_cls_logits)
+        self.model.train()
+
+        t_vals = data_dict["t_raw"]
+        c_vals = data_dict["c_raw"]
+
+        subgroups = defaultdict(lambda: {"r_pred": [], "r_true": [], "c_pred": [], "c_true": []})
+        for ti, ci, rp, rt, cp, ct in zip(t_vals, c_vals, pred_reg, yb_reg, pred_cls_probs, yb_cls):
+            key = (round(ti.item(), 2), round(ci.item(), 3))
+            subgroups[key]["r_pred"].append(rp.cpu())
+            subgroups[key]["r_true"].append(rt.cpu())
+            subgroups[key]["c_pred"].append(cp.cpu())
+            subgroups[key]["c_true"].append(ct.cpu())
+
+        agg_vals = []
+        for g in subgroups.values():
+            r_pred = torch.stack(g["r_pred"])
+            r_true = torch.stack(g["r_true"])
+            c_pred = torch.stack(g["c_pred"])
+            c_true = torch.stack(g["c_true"]).int()
+            active_mask = c_true == 1
+            mae     = mean_absolute_error(r_pred[active_mask], r_true[active_mask]) if active_mask.any() else torch.tensor(0.0)
+            pearson = pearson_corrcoef(r_pred[active_mask], r_true[active_mask])    if active_mask.any() else torch.tensor(0.0)
+            ap      = average_precision(c_pred, c_true, task="binary")              if c_true.sum() > 0  else torch.tensor(0.0)
+            agg_vals.append((ap - 5 * mae + pearson).item())
+
+        return float(sum(agg_vals) / len(agg_vals)) if agg_vals else float("-inf")
 
     def training_step(self, batch, batch_idx):
         Xb, yb_reg, yb_cls = batch_to_tensor(batch, self.device, feature_set=self.hparams.feature_set)
@@ -311,8 +347,10 @@ class MultiHeadLightning(pl.LightningModule):
                 if agg > getattr(self, "best_val_main_agg", float("-inf")):
                     self.best_val_main_agg   = agg
                     self.best_val_main_epoch = self.current_epoch
-                self.log("val_main/best_agg_metric", self.best_val_main_agg, prog_bar=True,  sync_dist=False)
-                self.log("val_main/best_agg_epoch",  getattr(self, "best_val_main_epoch", -1), prog_bar=False, sync_dist=False)
+                    self.best_test_main_agg  = self._eval_agg_on_dict(self.dict_test_main)
+                self.log("val_main/best_agg_metric",  self.best_val_main_agg,  prog_bar=True,  sync_dist=False)
+                self.log("val_main/best_agg_epoch",   getattr(self, "best_val_main_epoch", -1), prog_bar=False, sync_dist=False)
+                self.log("test_main/best_agg_metric", self.best_test_main_agg, prog_bar=False, sync_dist=False)
 
         # val_main: all subgroups
         log_slice("val_main", list(subgroup_results.values()))
@@ -331,28 +369,21 @@ class MultiHeadLightning(pl.LightningModule):
 
 
     def configure_optimizers(self):
-        max_lr = self.hparams.max_learning_rate
-        div_factor = 1.0 / self.hparams.initial_lr_ratio
-        final_div_factor = self.hparams.initial_lr_ratio / self.hparams.final_lr_ratio
         optimizer = torch.optim.AdamW(
             self.parameters(),
-            lr=max_lr * self.hparams.initial_lr_ratio,
+            lr=self.hparams.max_learning_rate,
             weight_decay=self.hparams.weight_decay,
         )
-        scheduler = OneCycleLR(
+        scheduler = CosineAnnealingLR(
             optimizer,
-            max_lr=max_lr,
-            total_steps=self.trainer.estimated_stepping_batches,
-            pct_start=self.hparams.pct_start,
-            anneal_strategy='cos',
-            div_factor=div_factor,
-            final_div_factor=final_div_factor,
+            T_max=self.hparams.epochs,
+            eta_min=self.hparams.eta_min,
         )
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "interval": "step",
+                "interval": "epoch",
             },
         }
 
@@ -373,7 +404,8 @@ class GrowthNetDataModule(pl.LightningDataModule):
         self.train_ds = PerCompoundDataset(
             self.config['metas_path'],
             self.config['train_smiles_path'],
-            k=self.config['samples'], seed=self.config['seed'] + epoch, num_fourier=3, noise=self.config['regression_noise']
+            k=self.config['samples'], seed=self.config['seed'] + epoch, num_fourier=3, noise=self.config['regression_noise'],
+            required_families=set(FEATURE_SETS[self.config['feature_set']]),
         )
 
         
@@ -442,17 +474,24 @@ def main():
     with open(config['metas_path'], "rb") as f:
         all_metas = pickle.load(f)
 
+    required_fams = set(FEATURE_SETS[config['feature_set']])
+
     val_smiles = set(open(config['val_smiles_path']).read().splitlines())
-    val_metas  = [m for m in all_metas if m.smiles in val_smiles]
+    val_metas  = [m for m in all_metas if m.smiles in val_smiles and required_fams.issubset(m.fps_by_family.keys())]
     print(f"[sweep_multihead] Building val dict from {len(val_metas)} val compounds...")
     dict_val_main = build_val_dict_from_metas(val_metas)
+
+    test_smiles = set(open(config['test_smiles_path']).read().splitlines())
+    test_metas  = [m for m in all_metas if m.smiles in test_smiles and required_fams.issubset(m.fps_by_family.keys())]
+    print(f"[sweep_multihead] Building test dict from {len(test_metas)} test compounds...")
+    dict_test_main = build_val_dict_from_metas(test_metas)
 
     # Infer input_dim from val dict
     Xte, _, _ = batch_to_tensor(dict_val_main, torch.device("cpu"), feature_set=config['feature_set'])
 
     # DataModule & Model
     dm = GrowthNetDataModule(config, dict_val_main)
-    model = MultiHeadLightning(input_dim=Xte.shape[1], config=config)
+    model = MultiHeadLightning(input_dim=Xte.shape[1], config=config, dict_test_main=dict_test_main)
 
     wandb_logger = WandbLogger()
     try:
@@ -481,7 +520,7 @@ def main():
         devices=1,
         logger=wandb_logger,
         log_every_n_steps=10,
-        enable_progress_bar=True,
+        enable_progress_bar=False,
         num_sanity_val_steps=0,
         callbacks=[checkpoint_cb]
     )
