@@ -49,6 +49,6 @@ source /home/ethan2/venvs/GrowthCurve/bin/activate
 # Use "python -m wandb agent" so that wandb spawns sweep runs via sys.executable
 # (the conda env's Python 3.10) rather than whatever "python" resolves to in PATH.
 #python -u accelerate launch --num_processes 3 sweep_multihead.py
-python -m wandb agent 'ethan_personal/Predictive model final sweep/mcvikiui'
+python -m wandb agent 'ethan_personal/Predictive model final sweep/vxc78kac'
 # A dummy and useless `sleep` to give you time to see your job with `squeue`.
 sleep 20s

@@ -38,6 +38,8 @@ from data_class import PerCompoundDataset, custom_collate, build_val_dict_from_m
 
 import argparse
 
+N_MIN_ACTIVES_FOR_REGRESSION = 5
+
 FEATURE_SETS = {
     "minimol": ["minimol_fp"],
     "boltz2_minimol": ["boltz2_rep", "minimol_fp"],
@@ -70,11 +72,11 @@ def parse_args():
     p.add_argument("--metas_path", type=str,
                    default="/home/ethan2/GrowthNet/data/splits/my_split_v1/all_compound_metas.pkl")
     p.add_argument("--train_smiles_path", type=str,
-                   default="/home/ethan2/GrowthNet/data/splits/my_split_v1/smiles_splits/train.txt")
+                   default="/home/ethan2/GrowthNet/data/splits/my_split_v1/smile_splits_v2/train.txt")
     p.add_argument("--val_smiles_path", type=str,
-                   default="/home/ethan2/GrowthNet/data/splits/my_split_v1/smiles_splits/val.txt")
+                   default="/home/ethan2/GrowthNet/data/splits/my_split_v1/smile_splits_v2/val.txt")
     p.add_argument("--test_smiles_path", type=str,
-                   default="/home/ethan2/GrowthNet/data/splits/my_split_v1/smiles_splits/test.txt")
+                   default="/home/ethan2/GrowthNet/data/splits/my_split_v1/smile_splits_v2/test.txt")
 
     return vars(p.parse_args())
 
@@ -196,6 +198,9 @@ class MultiHeadLightning(pl.LightningModule):
         self.val_outputs = defaultdict(lambda: {
             "r_pred": [], "r_true": [], "c_pred": [], "c_true": [], "n": 0
         })
+        self.train_outputs = defaultdict(lambda: {
+            "r_pred": [], "r_true": [], "c_pred": [], "c_true": []
+        })
         self.best_val_main_agg  = float("-inf")
         self.best_test_main_agg = float("-inf")
         self.dict_test_main = dict_test_main
@@ -225,19 +230,43 @@ class MultiHeadLightning(pl.LightningModule):
             subgroups[key]["c_pred"].append(cp.cpu())
             subgroups[key]["c_true"].append(ct.cpu())
 
-        agg_vals = []
+        rows = []
         for g in subgroups.values():
             r_pred = torch.stack(g["r_pred"])
             r_true = torch.stack(g["r_true"])
             c_pred = torch.stack(g["c_pred"])
             c_true = torch.stack(g["c_true"]).int()
             active_mask = c_true == 1
-            mae     = mean_absolute_error(r_pred[active_mask], r_true[active_mask]) if active_mask.any() else torch.tensor(0.0)
-            pearson = pearson_corrcoef(r_pred[active_mask], r_true[active_mask])    if active_mask.any() else torch.tensor(0.0)
-            ap      = average_precision(c_pred, c_true, task="binary")              if c_true.sum() > 0  else torch.tensor(0.0)
-            agg_vals.append((ap - 5 * mae + pearson).item())
+            ap = average_precision(c_pred, c_true, task="binary") if c_true.sum() > 0 else torch.tensor(0.0)
 
-        return float(sum(agg_vals) / len(agg_vals)) if agg_vals else float("-inf")
+            if active_mask.sum() >= N_MIN_ACTIVES_FOR_REGRESSION:
+                pred_act = r_pred[active_mask]
+                true_act = r_true[active_mask]
+                if pred_act.std() > 1e-6 and true_act.std() > 1e-6:
+                    pearson = pearson_corrcoef(pred_act, true_act)
+                    mae = mean_absolute_error(pred_act, true_act)
+                else:
+                    pearson = None
+                    mae = None
+            else:
+                pearson = None
+                mae = None
+
+            rows.append((mae, pearson, ap))
+
+        mae_vals = [r[0] for r in rows if r[0] is not None]
+        pear_vals = [r[1] for r in rows if r[1] is not None]
+        ap_vals = [r[2] for r in rows]
+
+        mae_m = sum(mae_vals) / len(mae_vals) if mae_vals else 0.0
+        pear_m = sum(pear_vals) / len(pear_vals) if pear_vals else 0.0
+        ap_m = sum(ap_vals) / len(ap_vals) if ap_vals else 0.0
+
+        agg = ap_m - 5 * mae_m + pear_m
+        if torch.isnan(torch.tensor(agg)):
+            agg = -1e6
+
+        return float(agg)
 
     def training_step(self, batch, batch_idx):
         Xb, yb_reg, yb_cls = batch_to_tensor(batch, self.device, feature_set=self.hparams.feature_set)
@@ -250,10 +279,92 @@ class MultiHeadLightning(pl.LightningModule):
         self.log("train/reg_loss", loss_reg, on_step=False, on_epoch=True, sync_dist=False, prog_bar=False)
         self.log("train/cls_loss", loss_cls, on_step=False, on_epoch=True, sync_dist=False, prog_bar=False)
         self.log("train/loss",     loss,     on_step=False, on_epoch=True, sync_dist=False, prog_bar=True)
-        
+
+        pred_cls_probs = torch.sigmoid(out_cls_logits).detach().cpu()
+        pred_reg_det   = out_reg.detach().cpu()
+        yb_reg_det     = yb_reg.detach().cpu()
+        yb_cls_det     = yb_cls.detach().cpu()
+
+        if batch["t_fourier"].ndim == 3:
+            N, k, _ = batch["t_fourier"].shape
+            t_vals = batch["t_raw"].reshape(N * k).cpu()
+            c_vals = batch["c_raw"].reshape(N * k).cpu()
+        else:
+            t_vals = batch["t_raw"].cpu()
+            c_vals = batch["c_raw"].cpu()
+
+        for ti, ci, r_pr, r_tr, c_pr, c_tr in zip(
+            t_vals, c_vals, pred_reg_det, yb_reg_det, pred_cls_probs, yb_cls_det
+        ):
+            key = (round(ti.item(), 2), round(ci.item(), 3))
+            g = self.train_outputs[key]
+            g["r_pred"].append(r_pr)
+            g["r_true"].append(r_tr)
+            g["c_pred"].append(c_pr)
+            g["c_true"].append(c_tr)
+
         return loss
     
 
+
+    def on_train_epoch_end(self):
+        rows = []
+        for g in self.train_outputs.values():
+            r_pred = torch.stack(g["r_pred"])
+            r_true = torch.stack(g["r_true"])
+            c_pred = torch.stack(g["c_pred"])
+            c_true = torch.stack(g["c_true"]).int()
+
+            active_mask = c_true == 1
+            ap = average_precision(c_pred, c_true, task="binary") if c_true.sum() > 0 else torch.tensor(0.0)
+            auc = auroc(c_pred, c_true, task="binary") if c_true.sum() > 0 else torch.tensor(0.0)
+            f1 = f1_score(c_pred > 0.5, c_true, task="binary") if c_true.sum() > 0 else torch.tensor(0.0)
+            rec = recall(c_pred > 0.5, c_true, task="binary") if c_true.sum() > 0 else torch.tensor(0.0)
+
+            if active_mask.sum() >= N_MIN_ACTIVES_FOR_REGRESSION:
+                pred_act = r_pred[active_mask]
+                true_act = r_true[active_mask]
+                if pred_act.std() > 1e-6 and true_act.std() > 1e-6:
+                    mae = mean_absolute_error(pred_act, true_act)
+                    pearson = pearson_corrcoef(pred_act, true_act)
+                else:
+                    mae = None
+                    pearson = None
+            else:
+                mae = None
+                pearson = None
+
+            rows.append((mae, pearson, auc, ap, f1, rec))
+
+        self.train_outputs.clear()
+        if not rows:
+            return
+
+        mae_vals = [r[0] for r in rows if r[0] is not None]
+        pear_vals = [r[1] for r in rows if r[1] is not None]
+        auc_vals = [r[2] for r in rows]
+        ap_vals = [r[3] for r in rows]
+        f1_vals = [r[4] for r in rows]
+        rec_vals = [r[5] for r in rows]
+
+        mae_m = sum(mae_vals) / len(mae_vals) if mae_vals else 0.0
+        pear_m = sum(pear_vals) / len(pear_vals) if pear_vals else 0.0
+        auc_m = sum(auc_vals) / len(auc_vals) if auc_vals else 0.0
+        ap_m = sum(ap_vals) / len(ap_vals) if ap_vals else 0.0
+        f1_m = sum(f1_vals) / len(f1_vals) if f1_vals else 0.0
+        rec_m = sum(rec_vals) / len(rec_vals) if rec_vals else 0.0
+
+        agg = ap_m - 5 * mae_m + pear_m
+        if torch.isnan(torch.tensor(agg)):
+            agg = -1e6
+
+        self.log("train/mae_active",       mae_m,  sync_dist=False)
+        self.log("train/pearson_active",   pear_m, sync_dist=False)
+        self.log("train/auc",              auc_m,  sync_dist=False)
+        self.log("train/ap",               ap_m,   sync_dist=False)
+        self.log("train/f1",               f1_m,   sync_dist=False)
+        self.log("train/recall",           rec_m,  sync_dist=False)
+        self.log("train/AP+Pearson-5*MAE", agg,    sync_dist=False)
 
     def validation_step(self, batch, batch_idx):
         Xb, yb_reg, yb_cls = batch_to_tensor(batch, self.device, feature_set=self.hparams.feature_set)
@@ -315,32 +426,54 @@ class MultiHeadLightning(pl.LightningModule):
             c_true = torch.stack(g["c_true"]).int()
 
             active_mask = c_true == 1
-            mae     = mean_absolute_error(r_pred[active_mask], r_true[active_mask]) if active_mask.any() else torch.tensor(0.0)
-            pearson = pearson_corrcoef(r_pred[active_mask], r_true[active_mask])    if active_mask.any() else torch.tensor(0.0)
-            auc = auroc(c_pred, c_true, task="binary")            if c_true.sum() > 0 else torch.tensor(0.0)
-            ap  = average_precision(c_pred, c_true, task="binary") if c_true.sum() > 0 else torch.tensor(0.0)
-            f1  = f1_score(c_pred > 0.5, c_true, task="binary")   if c_true.sum() > 0 else torch.tensor(0.0)
-            rec = recall(c_pred > 0.5, c_true, task="binary")     if c_true.sum() > 0 else torch.tensor(0.0)
+            auc = auroc(c_pred, c_true, task="binary") if c_true.sum() > 0 else torch.tensor(0.0)
+            ap = average_precision(c_pred, c_true, task="binary") if c_true.sum() > 0 else torch.tensor(0.0)
+            f1 = f1_score(c_pred > 0.5, c_true, task="binary") if c_true.sum() > 0 else torch.tensor(0.0)
+            rec = recall(c_pred > 0.5, c_true, task="binary") if c_true.sum() > 0 else torch.tensor(0.0)
+
+            if active_mask.sum() >= N_MIN_ACTIVES_FOR_REGRESSION:
+                pred_act = r_pred[active_mask]
+                true_act = r_true[active_mask]
+                if pred_act.std() > 1e-6 and true_act.std() > 1e-6:
+                    mae = mean_absolute_error(pred_act, true_act)
+                    pearson = pearson_corrcoef(pred_act, true_act)
+                else:
+                    mae = None
+                    pearson = None
+            else:
+                mae = None
+                pearson = None
+
             subgroup_results[(t, c)] = (mae, pearson, auc, ap, f1, rec)
 
         def log_slice(name: str, rows):
             if not rows:
                 return
-            n = len(rows)
-            mae_m  = sum(r[0] for r in rows) / n
-            pear_m = sum(r[1] for r in rows) / n
-            auc_m  = sum(r[2] for r in rows) / n
-            ap_m   = sum(r[3] for r in rows) / n
-            f1_m   = sum(r[4] for r in rows) / n
-            rec_m  = sum(r[5] for r in rows) / n
-            agg    = ap_m - 5 * mae_m + pear_m
 
-            self.log(f"{name}/mae_active",      mae_m,  sync_dist=False)
-            self.log(f"{name}/pearson_active",  pear_m, sync_dist=False)
-            self.log(f"{name}/auc",             auc_m,  sync_dist=False)
-            self.log(f"{name}/ap",              ap_m,   sync_dist=False)
-            self.log(f"{name}/f1",              f1_m,   sync_dist=False)
-            self.log(f"{name}/recall",          rec_m,  sync_dist=False)
+            mae_vals = [r[0] for r in rows if r[0] is not None]
+            pear_vals = [r[1] for r in rows if r[1] is not None]
+            auc_vals = [r[2] for r in rows]
+            ap_vals = [r[3] for r in rows]
+            f1_vals = [r[4] for r in rows]
+            rec_vals = [r[5] for r in rows]
+
+            mae_m = sum(mae_vals) / len(mae_vals) if mae_vals else 0.0
+            pear_m = sum(pear_vals) / len(pear_vals) if pear_vals else 0.0
+            auc_m = sum(auc_vals) / len(auc_vals) if auc_vals else 0.0
+            ap_m = sum(ap_vals) / len(ap_vals) if ap_vals else 0.0
+            f1_m = sum(f1_vals) / len(f1_vals) if f1_vals else 0.0
+            rec_m = sum(rec_vals) / len(rec_vals) if rec_vals else 0.0
+
+            agg = ap_m - 5 * mae_m + pear_m
+            if torch.isnan(torch.tensor(agg)):
+                agg = -1e6
+
+            self.log(f"{name}/mae_active",       mae_m,  sync_dist=False)
+            self.log(f"{name}/pearson_active",   pear_m, sync_dist=False)
+            self.log(f"{name}/auc",              auc_m,  sync_dist=False)
+            self.log(f"{name}/ap",               ap_m,   sync_dist=False)
+            self.log(f"{name}/f1",               f1_m,   sync_dist=False)
+            self.log(f"{name}/recall",           rec_m,  sync_dist=False)
             self.log(f"{name}/AP+Pearson-5*MAE", agg, prog_bar=(name == "val_main"), sync_dist=False)
 
             if name == "val_main":

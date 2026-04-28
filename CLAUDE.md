@@ -23,71 +23,182 @@ or edit the pyproject.toml file and rerun
 uv sync
 ```
 
+If you run any script in this project, you must do so by doing 
+
+```bash
+uv run
+```
+
+With the intended associated virtual environment
+
 
 ## Project Overview
 
-GrowthCurve is a machine learning project that trains multi-task neural networks to predict molecular behavior (optical density growth curves and compound activity) from chemical structure representations. The system uses PyTorch Lightning with hyperparameter optimization via Weights & Biases (W&B).
+GrowthNet trains multi-task neural networks to predict molecular behavior (optical density growth curves and compound activity) from chemical structure representations. The system uses PyTorch Lightning with hyperparameter optimization via Weights & Biases (W&B).
 
 **Core problem:** Given a chemical compound (SMILES), its molecular representation(s), and experimental conditions (time, concentration), predict:
 1. **Regression**: Optical Density (OD) measurements
 2. **Classification**: Activity status (binary: active/inactive)
 
-## Architecture Overview
 
-### Data Pipeline
+## Datasets and Cleaning
 
-1. **Representations**: Molecular fingerprints/embeddings computed from SMILES strings
-   - Built-in: MACCS (166-dim), ECFP (2048-dim), RDKit (2048-dim)
-   - External: Boltz2 (3072-dim, computed via boltz CLI)
-   - Custom: MiniMol (512-dim)
-   - Config: `FEATURE_SETS` in `sweep_multihead_lightning.py`
+Two experimental datasets feed the pipeline:
 
-2. **Compound Metadata** (`CompoundMeta`):
-   - Stores per-compound time-concentration grid data
-   - Tracks OD and classification targets across conditions
-   - Precomputed from CSV data and pickled for reuse
+### GrowthCurve (~2700 compounds)
+Plate-based OD measurements with on-plate DMSO controls at each (Plate, Concentration, Timepoint) condition. Cleaning steps:
+1. **Plate-level multiplicative correction**: Compute the median DMSO OD per plate, divide all wells on that plate by that median to anchor to 1.0.
+2. **Well-level iterative correction**: After plate correction, use the median of inactive-compound wells per (Plate, Concentration, Timepoint) block for a second pass of multiplicative normalization.
+3. **Activity threshold**: `median(DMSO) - 4 * MAD(DMSO)` per (Plate, Concentration, Timepoint). Compounds below this threshold at a given condition are labeled active (`is_Active = 1`).
 
-3. **Dataset Classes** (`sweeps/data_class.py`):
-   - `PerCompoundDataset`: Samples (t,c) points from each compound, interpolates targets
-   - `ExplicitDataset`: For validation/test with exact (t,c) points
-   - Uses `RectBivariateSpline` for 2D interpolation when multiple concentrations available
-   - Custom collate function handles variable fingerprint dimensionalities
+### Enamine DR (t6/t12 panels)
+No on-plate DMSO controls, so a bootstrapped correction is applied:
+1. Transfer correction factors estimated from the GrowthCurve dataset to the Enamine plates.
+2. Use the median of presumed-inactive compounds (those with OD near 1.0 after factor application) as the normalizing anchor.
+3. Apply the same `median - 4*MAD` threshold for activity labeling.
 
-### Training Pipeline
+Full methodology: `scripts/batch_correction_methodology.md`
+
+Both cleaned datasets are saved as labeled DataFrames:
+- `data/train/df_GrowthCurve_27000.pkl`
+- `data/train/df_combined_Enamine.pkl`
+
+
+## Building CompoundMeta Objects
+
+**Entry point**: `scripts/build_compound_metas.py`
+
+This script reads the two labeled DataFrames, then for each unique SMILES:
+1. Computes the **Murko scaffold** via `datamol.to_scaffold_murcko`.
+2. Looks up or computes molecular fingerprints, caching results in `data/smiles_representations.pkl`:
+   - `maccs_fp`: 166-dim MACCS keys
+   - `ecfp_fp`: 2048-dim ECFP4 (radius 2, folded)
+   - `rdkit_fp`: 2048-dim RDKit path fingerprint
+   - `minimol_fp`: 512-dim MiniMol embedding
+   - `boltz2_rep`: 3072-dim Boltz2 structural embedding (optional, precomputed externally)
+3. Builds a `CompoundMeta` dataclass with pivot tables (index: Timepoint, columns: Concentration) for both OD and `is_Active` labels, plus the fingerprint dict and scaffold.
+4. Saves the full list to `data/splits/my_split_v1/all_compound_metas.pkl`.
+
+**`CompoundMeta` fields** (defined in `sweeps/data_class.py`):
+- `compound`, `smiles`, `scaffold`
+- `pivot_od`, `pivot_cls`: DataFrames keyed by (Timepoint × Concentration)
+- `t_vals`, `c_vals`: sorted unique timepoints and concentrations
+- `single_conc`: True if only one concentration present (affects interpolation)
+- `t_min`, `t_max`, `logc_min`, `logc_max`: grid bounds
+- `is_active_at_12_50`: convenience flag for the t=12, c=50 condition
+- `fps_by_family`: dict mapping family name → numpy fingerprint array
+
+
+## Train/Val/Test Splits
+
+**Entry point**: `scripts/make_splits.py`
+
+Scaffold-cluster-based Monte Carlo split. Steps:
+
+1. **Load** `data/splits/my_split_v1/all_compound_metas.pkl`.
+2. **Scaffold clustering**: Compute Morgan FPs (r=2, 1024-dim) on each compound's Murko scaffold → kNN graph (k=15) → UMAP dimensionality reduction → Leiden community detection. Each cluster contains scaffolds that are structurally similar.
+3. **Precompute Tanimoto matrix**: N×N pairwise ECFP4 Tanimoto similarity between all compounds (used during MC sampling to enforce distance constraints).
+4. **Two-stage Monte Carlo sampling**:
+   - **Test set first** (target ~250 actives at t=12, c=50): Randomly sample clusters; accept a cluster if adding it keeps median max-Tanimoto from test to train ≈ 0.40, and the active count stays within tolerance.
+   - **Val set from remainder** (target median max-Tanimoto ≈ 0.42): Same procedure on the remaining non-test compounds.
+   - Train = everything not in val or test.
+5. **Outputs**:
+   - `data/splits/smile_splits_v2/train.txt`, `val.txt`, `test.txt` — one SMILES per line
+   - `data/splits/smile_splits_v2/clusters.csv` — cluster assignments
+
+The split text files are what `PerCompoundDataset` and `build_val_dict_from_metas` use at training time; they index into `all_compound_metas.pkl` by SMILES.
+
+
+## Model Architecture
 
 **Entry point**: `sweeps/sweep_multihead_lightning.py`
-- PyTorch Lightning module with dual-head architecture
-- Trunk network (shared) → Regression head + Classification head
-- Hyperparameter sweeps via W&B Bayes optimization
-- Metrics: Pearson correlation (regression), AUROC/F1 (classification)
 
-**Sweep config**: `sweeps/multihead_sweep.yml`
-- 10+ hyperparameters: learning rate, dropout, architecture depth/width, noise injection
-- Feature set selection: `"minimol_classic"` or other combinations
+### Input encoding
+- Molecular fingerprint(s) concatenated from the selected `feature_set`. Current sweep uses `"minimol_classic"` = `["minimol_fp", "ecfp_fp", "maccs_fp", "rdkit_fp"]` → 4826-dim total.
+- Condition encoding: `[c_raw, log(c_raw), fourier_time...]` where Fourier time uses sin/cos at frequencies 1–3, period T=15, offset `t' = t - 1`.
 
-### Data Organization
+### Network
+- **Trunk**: `trunk_layers` fully-connected blocks of (Linear → LayerNorm → ReLU → Dropout). Shared representation.
+- **Regression head**: `reg_layers` blocks → scalar OD prediction.
+- **Classification head**: `cls_layers` blocks → scalar logit (binary cross-entropy with logits).
+
+### Training
+- Loss: `MSE (regression) + loss_lambda * BCE (classification)`, weighted sum.
+- Sampler: `WeightedRandomSampler` balances active/inactive compounds per batch, controlled by `active_fraction` hyperparameter.
+- Scheduler: `CosineAnnealingLR` (OneCycleLR was tried; reverted).
+- Optional Gaussian noise on fingerprint inputs during training (`regression_noise`).
+
+### Dataset classes (`sweeps/data_class.py`)
+- `PerCompoundDataset`: Training. For each compound, samples `k` (t,c) points per epoch and interpolates OD/activity targets using `RectBivariateSpline` in (time, log-concentration) space. Single-conc compounds use 1D interpolation.
+- `build_val_dict_from_metas`: Builds a flat dict of explicit (t,c) points from pivot tables for val/test (no sampling).
+
+
+## Metrics and Sweep Optimization
+
+### Per-(t,c) subgroup metrics
+For each unique (time, concentration) cell in the val/test data, compute:
+- **AP** (Average Precision): classification, computed on all compounds in the cell.
+- **MAE** (Mean Absolute Error): regression on active compounds only.
+- **Pearson**: correlation between predicted and true OD on active compounds only.
+
+Pearson and MAE are only computed when `active_mask.sum() >= N_MIN_ACTIVES_FOR_REGRESSION` (= 5) **and** both `pred.std() > 1e-6` and `true.std() > 1e-6`. Cells below threshold contribute to AP but are excluded from the MAE/Pearson averages.
+
+### Aggregate metric
+```
+agg = AP_mean - 5 * MAE_mean + Pearson_mean
+```
+Where each mean is taken over only the subgroups that passed the threshold. If no subgroup qualifies, MAE and Pearson default to 0.0. If `agg` is still NaN after all guards, it is replaced with `-1e6` (finite sentinel so W&B Bayes still sees a signal).
+
+### Logged metrics
+- `val_main/AP+Pearson-5*MAE` — per-epoch aggregate (logged every epoch)
+- `val_main/best_agg_metric` — running best across epochs (used by W&B sweep optimizer)
+- `val_main/AP`, `val_main/MAE`, `val_main/Pearson` — individual components
+- Per-concentration slices: same metrics broken out by concentration value
+- `test_main/*` — test metrics logged when val improves
+
+### Sweep config (`sweeps/multihead_sweep.yml`)
+W&B Bayes sweep optimizing `val_main/best_agg_metric`. Key search ranges:
+- `trunk_dim`: 450–700, `reg_layers`: [2,3,4], `reg_hidden`: 16–75
+- `max_learning_rate`: 0.001–0.01 (log-uniform)
+- `dropout_rate`: 0.10–0.30, `weight_decay`: 0.0001–0.1 (log-uniform)
+- `active_fraction`: 0.30–0.50, `batch_size`: 4–15, `epochs`: 150–215
+- `regression_noise`: [0.0, 0.00025, 0.0005]
+- Fixed: `feature_set: minimol_classic`, `trunk_layers: 1`, `cls_layers: 0`
+
+
+## Data Organization
 
 ```
 data/
-  unique_smiles.txt                    # List of unique SMILES
-  smiles_index.pkl                     # SMILES → index mapping
-  smiles_representations.pkl           # Index → fingerprint dict
-  train/Celine_CompoundMetas_list.pkl  # Cached compound metadata
-  boltz_yamls/                         # Config files for Boltz predictions
-  boltz_output/                        # Raw Boltz embeddings
+  smiles_representations.pkl            # SMILES → {family: fingerprint} cache
+  train/
+    df_GrowthCurve_27000.pkl            # Cleaned GrowthCurve labeled DataFrame
+    df_combined_Enamine.pkl             # Cleaned Enamine DR labeled DataFrame
+  splits/
+    my_split_v1/
+      all_compound_metas.pkl            # List[CompoundMeta] for all compounds
+    smile_splits_v2/
+      train.txt / val.txt / test.txt    # SMILES split files (one per line)
+      clusters.csv                      # Scaffold cluster assignments
+  boltz_yamls/                          # Config files for Boltz predictions
+  boltz_output/                         # Raw Boltz embeddings
 
 sweeps/
-  data_class.py                        # Dataset definitions
-  sweep_multihead_lightning.py         # Model + training loop
-  multihead_sweep.yml                  # W&B sweep config
-  evaluate_model.ipynb                 # Analysis notebook
+  data_class.py                         # CompoundMeta dataclass + Dataset classes
+  sweep_multihead_lightning.py          # Model + training loop (PyTorch Lightning)
+  multihead_sweep.yml                   # W&B sweep config
+  evaluate_model.ipynb                  # Evaluation notebook
 
 scripts/
-  build_representation_dict.py         # Build smiles_representations.pkl
-  build_representation_dict.sh         # SLURM wrapper
-  build_training_data.py               # Create compound metadata
-  run_inference.py                     # Batch inference script
+  build_compound_metas.py               # Build all_compound_metas.pkl from raw DataFrames
+  make_splits.py                        # Scaffold-cluster MC split builder
+  build_representation_dict.py          # Build/update smiles_representations.pkl
+  build_representation_dict.sh          # SLURM wrapper for representation building
+  build_training_data.py                # Legacy: older pipeline (Celine_v1 split)
+  batch_correction_methodology.md       # Detailed batch correction methodology
+  figures/                              # Methodology figures
 ```
+
 
 ## Common Development Tasks
 
@@ -96,57 +207,62 @@ scripts/
 ```bash
 cd /home/ethan2/GrowthNet/sweeps
 wandb sweep multihead_sweep.yml
-# Get sweep ID from output, then in a SLURM script:
-wandb agent <PROJECT>/<ENTITY>/<SWEEP_ID>
+# Outputs: <PROJECT>/<ENTITY>/<SWEEP_ID>
 ```
 
-However, sweeps must be run using SLURM. You can see my script /home/ethan2/job.sh for an example of how to run a sweep given the <PROJECT>/<ENTITY>/<SWEEP_ID> output from 
-doing 
+Sweeps must be run via SLURM. See `/home/ethan2/job.sh` for the sweep agent invocation pattern.
 
 ### Building Molecular Representations
 
-Two-stage process (Boltz requires external prediction):
-
 ```bash
-# Stage 1: Prep
-python scripts/build_representation_dict.py --stage prep
+# Stage 1: Generate Boltz YAML configs and standard fingerprints
+uv run python scripts/build_representation_dict.py --stage prep
 
-# Then run: boltz predict ... (external, see script for details)
+# Run Boltz externally: boltz predict ... (see script for details)
 
-# Stage 2: Assemble
-python scripts/build_representation_dict.py --stage assemble
+# Stage 2: Assemble Boltz embeddings into smiles_representations.pkl
+uv run python scripts/build_representation_dict.py --stage assemble
 ```
 
-### Running Inference on New Compounds
+### Rebuilding CompoundMeta Objects
 
 ```bash
-python scripts/run_inference.py --input compounds.csv --model path/to/model.pt
+uv run python scripts/build_compound_metas.py
+# Reads df_GrowthCurve_27000.pkl + df_combined_Enamine.pkl
+# Writes data/splits/my_split_v1/all_compound_metas.pkl
 ```
 
-### Preparing Training Data
+### Rebuilding the Train/Val/Test Split
 
 ```bash
-python scripts/build_training_data.py --input raw_data.csv --output data/train/
+uv run python scripts/make_splits.py
+# Reads all_compound_metas.pkl
+# Writes data/splits/smile_splits_v2/{train,val,test}.txt + clusters.csv
 ```
+
 
 ## Key Design Patterns
 
-1. **Representation Flexibility**: Code uses `features_by_family` dict to handle variable-length fingerprints. Models select which fingerprints via `feature_set` parameter.
+1. **Representation Flexibility**: `fps_by_family` dict in `CompoundMeta` stores all fingerprint families. At training time, `PerCompoundDataset` selects families listed in the sweep's `feature_set` parameter and concatenates them.
 
-2. **Interpolation Strategy**: Uses `RectBivariateSpline` for smooth 2D interpolation in time-concentration space. Single-concentration compounds fall back to 1D interpolation.
+2. **Interpolation Strategy**: `RectBivariateSpline` in (time, log-concentration) space for compounds with >1 concentration. `single_conc=True` compounds fall back to 1D `UnivariateSpline` over time.
 
-3. **Multi-Task Learning**: Single trunk (shared learned features) feeds regression and classification heads. Loss weighted by `loss_lambda` parameter.
+3. **Multi-Task Learning**: Single trunk (shared learned features) feeds separate regression and classification heads. Loss weighting controlled by `loss_lambda`.
 
-4. **W&B Integration**: Metadata logged via `CompoundMeta`, sweeps configured in YAML, hyperparameter search runs asynchronously across compute cluster.
+4. **Metric Robustness**: Pearson and MAE are only computed on (t,c) subgroups with `N_MIN_ACTIVES_FOR_REGRESSION = 5` or more actives, plus a variance guard (`std > 1e-6`). This prevents NaN from propagating through the aggregate and killing the W&B Bayes optimizer.
 
-5. **Data Caching**: `CompoundMeta` objects are serialized to pickle to avoid recomputation; `smiles_representations.pkl` precomputes fingerprints.
+5. **Data Caching**: `smiles_representations.pkl` is a persistent cache; `build_compound_metas.py` only recomputes fingerprints for SMILES not already in the cache.
+
 
 ## Debugging Notes
 
-- **Missing CompoundMeta pickle**: `data_class.py` expects `data/train/Celine_CompoundMetas_list.pkl`. If missing, run `build_training_data.py` first.
-- **Boltz embeddings**: `build_representation_dict.py` fails at stage 2 if boltz_output/ is empty. Ensure stage 1 YAML files are generated and boltz CLI ran.
-- **Interpolation edge cases**: Single-concentration compounds use 1D splines; high-noise data may require larger `s` parameter in `rbs_reg`.
-- **W&B auth**: Ensure `wandb login` completed before running sweeps.
+- **Missing CompoundMeta pickle**: `data_class.py` loads from `data/splits/my_split_v1/all_compound_metas.pkl`. If missing, run `build_compound_metas.py` first.
+- **Missing split files**: `PerCompoundDataset` loads `data/splits/smile_splits_v2/{train,val,test}.txt`. If missing, run `make_splits.py` first.
+- **Boltz embeddings**: `build_representation_dict.py --stage assemble` fails if `data/boltz_output/` is empty. Run stage 1 first and then the external boltz CLI.
+- **Interpolation edge cases**: Single-concentration compounds use 1D splines; noisy data may need a larger `s` parameter in `rbs_reg`.
+- **val_main/best_agg_metric stuck at -inf**: Means the aggregate metric is NaN every epoch. Check that `N_MIN_ACTIVES_FOR_REGRESSION` guard and variance guards are in place in all three eval paths of `sweep_multihead_lightning.py`.
+- **W&B auth**: Ensure `wandb login` is completed before running sweeps.
+
 
 ## Dependencies (Not Exhaustive)
 
@@ -155,11 +271,5 @@ python scripts/build_training_data.py --input raw_data.csv --output data/train/
 - RDKit, datamol (chemistry)
 - scipy (interpolation)
 - pandas, numpy
-- See sweep scripts for full imports
-
-## Testing & Validation
-
-- Validation metrics: Pearson (regression), AUROC/F1 (classification)
-- Aggregated metric: `val_main/best_agg_metric` (used in sweep optimization)
-- Test evaluation: `sweeps/Claude_evaluate_on_validation.ipynb`
-- Model analysis: `sweeps/top30_sweep_analysis.ipynb`
+- minimol (MiniMol embeddings)
+- See `pyproject.toml` for full dependency list
